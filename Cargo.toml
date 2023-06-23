@@ -1,0 +1,13 @@
+[package]
+name = "leangz"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+memmap2 = "0.7"
+byteorder = "1.4"
+zerocopy = "0.6"
+hashbrown = "0.14"
+flate2 = "1.0"
