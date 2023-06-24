@@ -9,12 +9,13 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::mem::size_of;
-use std::path::Path;
 use zerocopy::{AsBytes, FromBytes, LayoutVerified, LE, U16, U32, U64};
 
 fn main() {
   let help = || panic!("usage: leangz FILE.olean");
   let mut do_decompress = false;
+  #[cfg(feature = "selftest")]
+  let mut do_selftest = false;
   // let mut file = None;
   let mut outfile = None;
   let mut args = std::env::args();
@@ -22,6 +23,11 @@ fn main() {
   let mut args = args.peekable();
   while let Some(arg) = args.peek() {
     match &**arg {
+      #[cfg(feature = "selftest")]
+      "-s" => {
+        do_selftest = true;
+        args.next();
+      }
       "-d" | "-x" => {
         do_decompress = true;
         args.next();
@@ -35,25 +41,37 @@ fn main() {
       _ => break,
     }
   }
+  #[cfg(feature = "selftest")]
+  if do_selftest {
+    for file in args {
+      println!("{file}");
+      let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
+      let mut lgzfile = std::io::Cursor::new(vec![]);
+      compress(&mmap, lgzfile.get_mut());
+      let mut oleanfile = std::io::Cursor::new(vec![]);
+      decompress(lgzfile, &mut oleanfile);
+      assert!(*mmap == *oleanfile.get_ref())
+    }
+    return
+  }
   if do_decompress {
     for file in args {
       println!("{file}");
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.olean"));
       let file = File::open(file).unwrap();
-      let outfile = File::create(outfile).unwrap();
-      decompress(file, outfile);
+      decompress(file, BufWriter::new(File::create(outfile).unwrap()));
     }
   } else {
     for file in args {
       println!("{file}");
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.lgz"));
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
-      compress(&mmap, outfile.as_ref());
+      compress(&mmap, BufWriter::new(File::create(outfile).unwrap()));
     }
   }
 }
 
-fn compress(olean: &[u8], outfile: &Path) {
+fn compress(olean: &[u8], mut outfile: impl Write) {
   let (header, rest) = LayoutVerified::<_, Header>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
@@ -68,10 +86,9 @@ fn compress(olean: &[u8], outfile: &Path) {
     });
     pos = pad_to(pos, 8).1;
   }
-  let mut file = BufWriter::new(File::create(outfile).unwrap());
-  file.write_all(lgz::MAGIC).unwrap();
+  outfile.write_all(lgz::MAGIC).unwrap();
   let mut w = LgzWriter {
-    file: flate2::write::GzEncoder::new(file, flate2::Compression::new(7)),
+    file: flate2::write::GzEncoder::new(outfile, flate2::Compression::new(7)),
     refs: &refs,
     offset,
     backrefs: Default::default(),
@@ -185,7 +202,7 @@ fn on_subobjs(buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
       let (capacity, pos) = parse_u32(buf, pos);
       let (size, pos) = parse_u32(buf, pos);
       debug_assert!(
-        header.cs_sz.get() == 24 + (8 * capacity as u16) && size & 0x7FFFFFFF == capacity
+        header.cs_sz.get() == ((capacity + 3) as u16) << 3 && size & 0x7FFFFFFF == capacity
       );
       let (_limbs_ptr, pos) = parse_u64(buf, pos);
       pos + (8 * capacity) as usize
@@ -386,13 +403,12 @@ impl<W: Write> LgzWriter<'_, W> {
   }
 }
 
-fn decompress(mut infile: File, outfile: File) {
+fn decompress(mut infile: impl Read, mut out: impl Write + Seek) {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
   assert_eq!(&magic, lgz::MAGIC);
   let mut file = flate2::read::GzDecoder::new(infile);
   let base = (file.read_u32::<LE>().unwrap() as u64) << 16;
-  let mut out = BufWriter::new(outfile);
   out.write_all(b"oleanfile!!!!!!!").unwrap();
   out.write_u64::<LE>(base).unwrap();
   out.write_u64::<LE>(0).unwrap(); // fixed below
@@ -410,16 +426,16 @@ fn decompress(mut infile: File, outfile: File) {
   w.out.flush().unwrap();
 }
 
-struct LgzDecompressor<R> {
+struct LgzDecompressor<R, W> {
   file: R,
-  out: BufWriter<File>,
+  out: W,
   backrefs: Vec<u64>,
   pos: u64,
   stack: Vec<U64<LE>>,
   temp: Vec<u8>,
 }
 
-impl<R: Read> LgzDecompressor<R> {
+impl<R: Read, W: Write> LgzDecompressor<R, W> {
   fn write_header(&mut self, tag: u8, cs_sz: u16, num_fields: u8) {
     let header = ObjHeader { rc: 0.into(), cs_sz: cs_sz.into(), num_fields, tag };
     self.out.write_all(header.as_bytes()).unwrap();
@@ -558,7 +574,7 @@ impl<R: Read> LgzDecompressor<R> {
         let sign_size = self.read_i64(tag) as i32;
         let capacity = sign_size as u32 & 0x7FFFFFFF;
         let pos = self.pos;
-        self.write_header(tag::MPZ, 1, 0);
+        self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
         self.write_u32(capacity);
         self.write_u32(sign_size as u32);
         self.write_u64(self.pos + 8);
