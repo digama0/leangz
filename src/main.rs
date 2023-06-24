@@ -56,7 +56,9 @@ fn main() {
 fn compress(olean: &[u8], outfile: &Path) {
   let (header, rest) = LayoutVerified::<_, Header>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
-  let offset = header.base.get() + size_of::<Header>() as u64;
+  let base = header.base.get();
+  let offset = base + size_of::<Header>() as u64;
+  assert!(base & !((u32::MAX as u64) << 16) == 0);
   let mut refs = vec![0u8; rest.len() >> 3];
   let mut pos = 0;
   while pos < rest.len() {
@@ -75,7 +77,7 @@ fn compress(olean: &[u8], outfile: &Path) {
     backrefs: Default::default(),
     buf: rest,
   };
-  w.file.write_all(header.base.as_bytes()).unwrap();
+  w.file.write_all(&((base >> 16) as u32).to_le_bytes()).unwrap();
   w.write_obj(header.root.get());
   w.file.finish().unwrap();
 }
@@ -389,7 +391,7 @@ fn decompress(mut infile: File, outfile: File) {
   infile.read_exact(&mut magic).unwrap();
   assert_eq!(&magic, lgz::MAGIC);
   let mut file = flate2::read::GzDecoder::new(infile);
-  let base = file.read_u64::<LE>().unwrap();
+  let base = (file.read_u32::<LE>().unwrap() as u64) << 16;
   let mut out = BufWriter::new(outfile);
   out.write_all(b"oleanfile!!!!!!!").unwrap();
   out.write_u64::<LE>(base).unwrap();
@@ -481,12 +483,12 @@ impl<R: Read> LgzDecompressor<R> {
     let mut len = 0;
     loop {
       let c = self.file.read_u8().unwrap();
-      if c & 0x80 == 0 {
-        len += 1;
-      }
       self.temp.push(c);
       if c == 0 {
         break
+      }
+      if c & 0xC0 != 0x80 {
+        len += 1;
       }
     }
     let pos = self.pos;
