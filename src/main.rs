@@ -1,3 +1,4 @@
+use byteorder::ByteOrder;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 use hashbrown::HashMap;
@@ -5,11 +6,11 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::mem::size_of;
 use zerocopy::{AsBytes, FromBytes, LayoutVerified, LE, U16, U32, U64};
+
+const ENABLE_EXPRISH: bool = true;
 
 fn main() {
   let help = || panic!("usage: leangz FILE.olean");
@@ -48,9 +49,8 @@ fn main() {
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
       let mut lgzfile = std::io::Cursor::new(vec![]);
       compress(&mmap, lgzfile.get_mut());
-      let mut oleanfile = std::io::Cursor::new(vec![]);
-      decompress(lgzfile, &mut oleanfile);
-      assert!(*mmap == *oleanfile.get_ref())
+      let oleanfile = decompress(lgzfile);
+      assert!(*mmap == *oleanfile)
     }
     return
   }
@@ -59,7 +59,7 @@ fn main() {
       println!("{file}");
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.olean"));
       let file = File::open(file).unwrap();
-      decompress(file, BufWriter::new(File::create(outfile).unwrap()));
+      std::fs::write(outfile, decompress(file)).unwrap()
     }
   } else {
     for file in args {
@@ -87,16 +87,19 @@ fn compress(olean: &[u8], mut outfile: impl Write) {
     pos = pad_to(pos, 8).1;
   }
   outfile.write_all(lgz::MAGIC).unwrap();
+  let outfile = flate2::write::GzEncoder::new(outfile, flate2::Compression::new(7));
   let mut w = LgzWriter {
-    file: flate2::write::GzEncoder::new(outfile, flate2::Compression::new(7)),
+    file: WithPosition { r: outfile, pos: 4 },
     refs: &refs,
     offset,
     backrefs: Default::default(),
     buf: rest,
+    depth: 0,
   };
   w.file.write_all(&((base >> 16) as u32).to_le_bytes()).unwrap();
-  w.write_obj(header.root.get());
-  w.file.finish().unwrap();
+  w.write_obj(header.root.get(), LgzMode::Normal);
+  w.file.r.finish().unwrap();
+  // w.file.flush().unwrap();
 }
 
 #[repr(C, align(8))]
@@ -114,6 +117,9 @@ struct ObjHeader {
   cs_sz: U16<LE>,
   num_fields: u8,
   tag: u8,
+}
+impl ObjHeader {
+  fn sfields(&self) -> u16 { (self.cs_sz.get() >> 3).saturating_sub(self.num_fields as u16 + 1) }
 }
 
 macro_rules! bin_parser {
@@ -195,14 +201,15 @@ fn on_subobjs(buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
       let (capacity, pos) = parse_u64(buf, pos);
       debug_assert!(header.cs_sz.get() == 1 && size == capacity);
       let (_length, pos) = parse_u64(buf, pos);
-      debug_assert!(buf[pos..][..size as usize].last() == Some(&0));
       pos + capacity as usize
     }
     tag::MPZ => {
       let (capacity, pos) = parse_u32(buf, pos);
-      let (size, pos) = parse_u32(buf, pos);
+      let (size, pos) = parse_i32(buf, pos);
       debug_assert!(
-        header.cs_sz.get() == ((capacity + 3) as u16) << 3 && size & 0x7FFFFFFF == capacity
+        header.cs_sz.get() == ((capacity + 3) as u16) << 3
+          && size.unsigned_abs() == capacity
+          && capacity != 0
       );
       let (_limbs_ptr, pos) = parse_u64(buf, pos);
       pos + (8 * capacity) as usize
@@ -244,9 +251,19 @@ fn on_array_subobjs(buf: &[u8], size: u64, mut pos: usize, mut f: impl FnMut(u64
   pos
 }
 
+impl<W: Write> Write for WithPosition<W> {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    let n = self.r.write(buf)?;
+    self.pos += n;
+    Ok(n)
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> { self.r.flush() }
+}
 struct LgzWriter<'a, W> {
   buf: &'a [u8],
-  file: W,
+  file: WithPosition<W>,
+  depth: usize,
   offset: u64,
   refs: &'a [u8],
   backrefs: HashMap<u64, u32>,
@@ -254,12 +271,17 @@ struct LgzWriter<'a, W> {
 
 mod lgz {
   pub(crate) const MAGIC: &[u8; 4] = b"LGZ!";
+
+  // These are valid in normal and exprish mode
   pub(crate) const UINT0: u8 = 0xe0;
   pub(crate) const INT1: u8 = 0xf0;
   pub(crate) const INT2: u8 = 0xf1;
   pub(crate) const INT4: u8 = 0xf2;
   pub(crate) const INT8: u8 = 0xf3;
   pub(crate) const SAVE: u8 = 0xf5;
+  pub(crate) const BACKREF: u8 = 0xff;
+
+  // only valid in normal mode
   pub(crate) const ARRAY: u8 = 0xf6;
   pub(crate) const BIG_CTOR: u8 = 0xf7;
   pub(crate) const SCALAR_ARRAY: u8 = 0xf8;
@@ -268,7 +290,129 @@ mod lgz {
   pub(crate) const THUNK: u8 = super::tag::THUNK;
   pub(crate) const TASK: u8 = super::tag::TASK;
   pub(crate) const REF: u8 = super::tag::REF;
-  pub(crate) const BACKREF: u8 = 0xff;
+  pub(crate) const EXPRISH: u8 = 0xfe;
+
+  // only valid in exprish mode
+  pub(crate) mod exprish {
+    use crate::mix_hash;
+
+    pub(crate) const NORMAL: u8 = 0xaa;
+
+    pub(crate) const NAME_STR: u8 = 0x00;
+    pub(crate) const NAME_NUM: u8 = 0x01;
+    pub(crate) const NAME_ANON_HASH: u64 = 1723;
+
+    pub(crate) const LEVEL_SUCC: u8 = 0x02;
+    pub(crate) const LEVEL_MAX: u8 = 0x03;
+    pub(crate) const LEVEL_IMAX: u8 = 0x04;
+    pub(crate) const LEVEL_PARAM: u8 = 0x05;
+    pub(crate) const LEVEL_MVAR: u8 = 0x06;
+    pub(crate) const fn pack_level_data(h: u32, depth: u32, bits: u8) -> u64 {
+      (h as u64) | (bits as u64) << 32 | (depth as u64) << 40
+    }
+    pub(crate) const fn unpack_level_data(data: u64) -> (u32, u32, u8) {
+      (data as u32, (data >> 40) as u32, (data >> 32) as u8)
+    }
+
+    pub(crate) const LEVEL_ZERO_DATA: u64 = pack_level_data(2221, 0, 0);
+    pub(crate) const fn level_succ_data(data: u64) -> u64 {
+      let (h, depth, bits) = unpack_level_data(data);
+      pack_level_data(mix_hash(2243, h as u64) as u32, depth + 1, bits)
+    }
+    pub(crate) fn level_data_binary(salt: u64, data1: u64, data2: u64) -> u64 {
+      let (h1, depth1, bits1) = unpack_level_data(data1);
+      let (h2, depth2, bits2) = unpack_level_data(data2);
+      let h = mix_hash(salt, mix_hash(h1 as u64, h2 as u64)) as u32;
+      pack_level_data(h, depth1.max(depth2) + 1, bits1 | bits2)
+    }
+    pub(crate) fn level_max_data(data1: u64, data2: u64) -> u64 {
+      level_data_binary(2251, data1, data2)
+    }
+    pub(crate) fn level_imax_data(data1: u64, data2: u64) -> u64 {
+      level_data_binary(2267, data1, data2)
+    }
+    pub(crate) const fn level_param_data(hash: u64) -> u64 {
+      pack_level_data(mix_hash(2239, hash) as u32, 0, 2)
+    }
+    pub(crate) const fn level_mvar_data(hash: u64) -> u64 {
+      pack_level_data(mix_hash(2237, hash) as u32, 0, 1)
+    }
+
+    pub(crate) const EXPR_BVAR: u8 = 0x07;
+    pub(crate) const EXPR_FVAR: u8 = 0x08;
+    pub(crate) const EXPR_MVAR: u8 = 0x09;
+    pub(crate) const EXPR_SORT: u8 = 0x0a;
+    pub(crate) const EXPR_LIT: u8 = 0x0b;
+    pub(crate) const EXPR_MDATA: u8 = 0x0c;
+    pub(crate) const EXPR_PROJ: u8 = 0x0d;
+    pub(crate) const EXPR_LET: u8 = 0x0e;
+    pub(crate) const EXPR_LET_END: u8 = 0x0f;
+    pub(crate) const EXPR_LAMBDA: u8 = 0x18;
+    pub(crate) const _EXPR_FORALL: u8 = 0x1c;
+    pub(crate) const EXPR_FORALL_END: u8 = 0x1f;
+    pub(crate) const EXPR_APP: u8 = 0x20;
+    pub(crate) const EXPR_APP_END: u8 = EXPR_APP + 0x1f;
+    pub(crate) const EXPR_CONST_APP: u8 = 0x40;
+    pub(crate) const EXPR_CONST_APP_END: u8 = EXPR_CONST_APP + 0x1f;
+
+    pub(crate) const fn pack_expr_data(h: u64, bvars: u32, depth: u8, bits: u8) -> u64 {
+      (h as u32 as u64) | (depth as u64) << 32 | (bits as u64) << 40 | (bvars as u64) << 44
+    }
+    pub(crate) const fn unpack_expr_data(data: u64) -> (u64, u32, u8, u8) {
+      (data as u32 as u64, (data >> 44) as u32, (data >> 32) as u8, (data >> 40 & 15) as u8)
+    }
+
+    pub(crate) const fn expr_const_data(hash1: u64, hash2: u64, bits2: u8) -> u64 {
+      pack_expr_data(mix_hash(5, mix_hash(hash1, hash2)), 0, 0, bits2 << 2)
+    }
+    pub(crate) const fn expr_bvar_data(n: u64) -> u64 {
+      pack_expr_data(mix_hash(7, n), n as u32 + 1, 0, 0)
+    }
+    pub(crate) const fn expr_sort_data(data: u64) -> u64 {
+      let (h, _, bits) = unpack_level_data(data);
+      pack_expr_data(mix_hash(11, h as u64), 0, 0, bits << 2)
+    }
+    pub(crate) const fn expr_fvar_data(hash: u64) -> u64 {
+      pack_expr_data(mix_hash(13, mix_hash(0, hash)), 0, 0, 1)
+    }
+    pub(crate) const fn expr_mvar_data(hash: u64) -> u64 {
+      pack_expr_data(mix_hash(17, mix_hash(0, hash)), 0, 0, 2)
+    }
+    pub(crate) const fn expr_mdata_data(data: u64) -> u64 {
+      let (h, bvars, depth, bits) = unpack_expr_data(data);
+      let h = mix_hash(depth as u64 + 1, h);
+      pack_expr_data(h, bvars, depth.saturating_add(1), bits)
+    }
+    pub(crate) const fn expr_proj_data(hash1: u64, num2: u64, data3: u64) -> u64 {
+      let (h, bvars, depth, bits) = unpack_expr_data(data3);
+      let h = mix_hash(depth as u64 + 1, mix_hash(hash1, mix_hash(num2, h)));
+      pack_expr_data(h, bvars, depth.saturating_add(1), bits)
+    }
+    pub(crate) fn expr_app_data(data1: u64, data2: u64) -> u64 {
+      let (_, bvars1, depth1, bits1) = unpack_expr_data(data1);
+      let (_, bvars2, depth2, bits2) = unpack_expr_data(data2);
+      let depth = depth1.max(depth2).saturating_add(1);
+      pack_expr_data(mix_hash(data1, data2), bvars1.max(bvars2), depth, bits1 | bits2)
+    }
+    pub(crate) fn expr_binder_data(data1: u64, data2: u64) -> u64 {
+      let (h1, bvars1, depth1, bits1) = unpack_expr_data(data1);
+      let (h2, bvars2, depth2, bits2) = unpack_expr_data(data2);
+      let depth = depth1.max(depth2);
+      let h = mix_hash(depth as u64 + 1, mix_hash(h1, h2));
+      let bvars = bvars1.max(bvars2.saturating_sub(1));
+      pack_expr_data(h, bvars, depth.saturating_add(1), bits1 | bits2)
+    }
+    pub(crate) fn expr_let_data(data1: u64, data2: u64, data3: u64) -> u64 {
+      let (h1, bvars1, depth1, bits1) = unpack_expr_data(data1);
+      let (h2, bvars2, depth2, bits2) = unpack_expr_data(data2);
+      let (h3, bvars3, depth3, bits3) = unpack_expr_data(data3);
+      let depth = depth1.max(depth2).max(depth3);
+      let h = mix_hash(depth as u64 + 1, mix_hash(h1, mix_hash(h2, h3)));
+      let bvars = bvars1.max(bvars2).max(bvars3.saturating_sub(1));
+      pack_expr_data(h, bvars, depth.saturating_add(1), bits1 | bits2 | bits3)
+    }
+    pub(crate) fn expr_lit_data(hash: u64) -> u64 { pack_expr_data(mix_hash(3, hash), 0, 0, 0) }
+  }
 
   pub(crate) const fn pack_ctor(ctor: u8, num_fields: u8, sfields: u16) -> Option<u8> {
     // This encoding works for all constructors in the Lean library, and in particular
@@ -307,6 +451,189 @@ mod lgz {
   };
 }
 
+const fn mix_hash(mut h: u64, mut k: u64) -> u64 {
+  let m: u64 = 0xc6a4a7935bd1e995;
+  let r: u64 = 47;
+  k = k.wrapping_mul(m);
+  k ^= k >> r;
+  k ^= m;
+  h ^= k;
+  h = h.wrapping_mul(m);
+  h
+}
+
+fn str_hash(bytes: &[u8]) -> u64 {
+  const M: u64 = 0xc6a4a7935bd1e995;
+  const R: u64 = 47;
+  const SEED: u64 = 11;
+  let mut h: u64 = SEED ^ (bytes.len() as u64).wrapping_mul(M);
+
+  let (data, rest) =
+    LayoutVerified::<_, [u64]>::new_slice_from_prefix(bytes, bytes.len() / 8).unwrap();
+  for &(mut k) in &*data {
+    k = k.wrapping_mul(M);
+    k ^= k >> R;
+    k = k.wrapping_mul(M);
+
+    h ^= k;
+    h = h.wrapping_mul(M);
+  }
+
+  if !rest.is_empty() {
+    let mut buf = [0; 8];
+    buf[..rest.len()].copy_from_slice(rest);
+    h ^= u64::from_le_bytes(buf);
+    h = h.wrapping_mul(M);
+  }
+
+  h ^= h >> R;
+  h = h.wrapping_mul(M);
+  h ^= h >> R;
+  h
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LgzMode {
+  Normal,
+  Exprish,
+}
+
+fn get_num_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 == 1 {
+    Some(ptr >> 1)
+  } else {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.tag == tag::MPZ {
+      let (_capacity, pos) = parse_u32(buf, pos);
+      let (sign_size, pos) = parse_i32(buf, pos);
+      let (_limbs_ptr, pos) = parse_u64(buf, pos);
+      let (lo, _) = parse_u64(buf, pos);
+      return Some(if sign_size < 0 { lo.wrapping_neg() } else { lo })
+    }
+    None
+  }
+}
+
+#[cfg(feature = "selftest")]
+fn get_str(buf: &[u8], offset: u64, ptr: u64) -> &str {
+  if ptr & 1 == 0 {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.tag == tag::STRING {
+      let (size, pos) = parse_u64(buf, pos);
+      return std::str::from_utf8(&buf[pos + 16..][..(size - 1) as usize]).unwrap()
+    }
+  }
+  panic!()
+}
+
+#[cfg(feature = "selftest")]
+fn get_name<'a>(buf: &'a [u8], offset: u64, ptr: u64, out: &mut Vec<Result<&'a str, u64>>) {
+  if ptr & 1 == 1 {
+    if (ptr >> 1) == 0 {
+      // Name.anonymous
+      return
+    }
+  } else {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.tag == 1 && header.num_fields == 2 {
+      let (ptr1, pos) = parse_u64(buf, pos);
+      let (ptr2, _) = parse_u64(buf, pos);
+      get_name(buf, offset, ptr1, out);
+      out.push(Ok(get_str(buf, offset, ptr2)));
+      return
+    } else if header.tag == 2 && header.num_fields == 2 {
+      let (ptr1, pos) = parse_u64(buf, pos);
+      let (ptr2, _) = parse_u64(buf, pos);
+      get_name(buf, offset, ptr1, out);
+      out.push(Err(ptr2 >> 1));
+      return
+    }
+  }
+  panic!()
+}
+
+fn get_name_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 == 1 {
+    if (ptr >> 1) == 0 {
+      // Name.anonymous
+      return Some(lgz::exprish::NAME_ANON_HASH)
+    }
+  } else {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.sfields() >= 1 {
+      return Some(parse_u64(buf, pos + 8 * header.num_fields as usize).0)
+    }
+  }
+  None
+}
+
+fn get_str_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 != 1 {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.tag == tag::STRING {
+      let (size, pos) = parse_u64(buf, pos);
+      return Some(str_hash(&buf[pos + 16..][..(size - 1) as usize]))
+    }
+  }
+  None
+}
+
+fn get_level_data(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 == 1 {
+    if (ptr >> 1) == 0 {
+      // Level.zero
+      return Some(lgz::exprish::LEVEL_ZERO_DATA)
+    }
+  } else {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.sfields() >= 1 {
+      return Some(parse_u64(buf, pos + 8 * header.num_fields as usize).0)
+    }
+  }
+  None
+}
+
+fn get_expr_data(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 == 0 {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.sfields() >= 1 {
+      return Some(parse_u64(buf, pos + 8 * header.num_fields as usize).0)
+    }
+  }
+  None
+}
+fn get_lit_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 != 0 {
+    return None
+  }
+  let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+  match header.tag {
+    0 => get_num_hash(buf, offset, parse_u64(buf, pos).0),
+    1 => get_str_hash(buf, offset, parse_u64(buf, pos).0),
+    _ => None,
+  }
+}
+
+fn get_list_level_data(buf: &[u8], offset: u64, mut ptr: u64) -> (u64, u8) {
+  let (mut hash, mut bits) = (7, 0);
+  while ptr & 1 == 0 {
+    let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+    if header.tag != 1 {
+      break
+    }
+    if header.num_fields >= 2 {
+      let (ptr1, pos) = parse_u64(buf, pos);
+      let (ptr2, _) = parse_u64(buf, pos);
+      let Some(data) = get_level_data(buf, offset, ptr1) else { break };
+      let (h1, _, bits1) = lgz::exprish::unpack_level_data(data);
+      hash = mix_hash(hash, h1 as u64);
+      bits |= bits1;
+      ptr = ptr2
+    }
+  }
+  (hash, bits)
+}
+
 impl<W: Write> LgzWriter<'_, W> {
   fn write_i64(&mut self, num: i64) {
     if (0..16).contains(&num) {
@@ -326,49 +653,419 @@ impl<W: Write> LgzWriter<'_, W> {
     }
   }
 
-  fn write_obj(&mut self, ptr: u64) {
+  fn is_reused(&mut self, ptr: u64) -> bool { self.refs[(ptr - self.offset) as usize >> 3] > 1 }
+
+  fn write_op(&mut self, cur_mode: LgzMode, mode: LgzMode, op: u8) {
+    match (cur_mode, mode) {
+      (LgzMode::Normal, LgzMode::Exprish) => self.file.write_all(&[lgz::EXPRISH, op]).unwrap(),
+      (LgzMode::Exprish, LgzMode::Normal) => {
+        #[cfg(feature = "selftest")]
+        panic!("!!! {:x}", self.file.pos);
+        #[cfg(not(feature = "selftest"))]
+        self.file.write_all(&[lgz::exprish::NORMAL, op]).unwrap()
+      }
+      _ => self.file.write_all(&[op]).unwrap(),
+    }
+  }
+
+  fn parse_nary_app(
+    &mut self, pos: usize, mode: LgzMode, ctor: u8, num_fields: u8, sfields: u16,
+  ) -> Option<()> {
+    let mut stack = vec![];
+    let mut ptr = None;
+    let mut state = (pos, ctor, num_fields, sfields);
+    loop {
+      match state {
+        (pos, 4, 2, 1) => {
+          // Expr.const
+          let _p0 = pos - size_of::<ObjHeader>();
+          let (ptr1, pos) = parse_u64(self.buf, pos);
+          let (ptr2, pos) = parse_u64(self.buf, pos);
+          let Some(hash1) = get_name_hash(self.buf, self.offset, ptr1) else { break };
+          let (hash2, bits2) = get_list_level_data(self.buf, self.offset, ptr2);
+          if lgz::exprish::expr_const_data(hash1, hash2, bits2) == parse_u64(self.buf, pos).0 {
+            self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_CONST_APP + stack.len() as u8);
+            self.write_obj(ptr1, LgzMode::Exprish);
+            self.write_obj(ptr2, LgzMode::Normal);
+            for ptr2 in stack.into_iter().rev() {
+              self.write_obj(ptr2, LgzMode::Exprish);
+            }
+            return Some(())
+          }
+          #[cfg(feature = "selftest")]
+          panic!(
+            "{_p0}: failed const data: {hash1:x} + {hash2:x} + {bits2:x} = {:x} != {:x}",
+            lgz::exprish::expr_const_data(hash1, hash2, bits2),
+            parse_u64(self.buf, pos).0
+          )
+        }
+        (pos, 5, 2, 1) if stack.len() < 0x20 => {
+          // Expr.app
+          let _p0 = pos - size_of::<ObjHeader>();
+          let (ptr1, pos) = parse_u64(self.buf, pos);
+          let (ptr2, pos) = parse_u64(self.buf, pos);
+          let Some(data1) = get_expr_data(self.buf, self.offset, ptr1) else { break };
+          let Some(data2) = get_expr_data(self.buf, self.offset, ptr2) else { break };
+          if lgz::exprish::expr_app_data(data1, data2) == parse_u64(self.buf, pos).0 {
+            ptr = Some(ptr1);
+            stack.push(ptr2);
+            if ptr1 & 1 == 0 && !self.is_reused(ptr1) {
+              let (header, pos) = parse::<ObjHeader>(self.buf, (ptr1 - self.offset) as usize);
+              state = (pos, header.tag, header.num_fields, header.sfields());
+              continue
+            }
+          }
+          #[cfg(feature = "selftest")]
+          {
+            panic!(
+              "{_p0}: failed app data: {data1:x} + {data2:x} = {:x} != {:x}",
+              lgz::exprish::expr_app_data(data1, data2),
+              parse_u64(self.buf, pos).0,
+            )
+          }
+        }
+        _ => {}
+      }
+      break
+    }
+    let ptr = ptr?;
+    debug_assert!(!stack.is_empty());
+    self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_APP + stack.len() as u8);
+    self.write_obj(ptr, LgzMode::Exprish);
+    for ptr2 in stack.into_iter().rev() {
+      self.write_obj(ptr2, LgzMode::Exprish);
+    }
+    Some(())
+  }
+
+  fn try_write_exprish_ctor(
+    &mut self, pos: usize, mode: LgzMode, ctor: u8, num_fields: u8, sfields: u16,
+  ) -> Option<()> {
+    match (ctor, num_fields, sfields) {
+      // Name.anonymous, Level.zero not needed because it is a scalar
+      (1, 2, 1) => {
+        // Name.str
+        let _p0 = pos - size_of::<ObjHeader>();
+        let (ptr1, pos) = parse_u64(self.buf, pos);
+        let (ptr2, pos) = parse_u64(self.buf, pos);
+        let h1 = get_name_hash(self.buf, self.offset, ptr1)?;
+        let h2 = get_str_hash(self.buf, self.offset, ptr2)?;
+        if mix_hash(h1, h2) == parse_u64(self.buf, pos).0 {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::NAME_STR);
+          self.write_obj(ptr1, LgzMode::Exprish);
+          self.write_obj(ptr2, LgzMode::Normal);
+          return Some(())
+        }
+        #[cfg(feature = "selftest")]
+        {
+          let mut out = vec![];
+          get_name(self.buf, self.offset, ptr1, &mut out);
+          out.push(Ok(get_str(self.buf, self.offset, ptr2)));
+          panic!(
+            "{_p0}: failed name.str hash: {h1:x} + {h2:x} = {:x} != {:x} in {out:?}",
+            mix_hash(h1, h2),
+            parse_u64(self.buf, pos).0
+          )
+        }
+      }
+      (1, 1, 1) => {
+        // Level.succ
+        let _p0 = pos - size_of::<ObjHeader>();
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        return (|| {
+          if lgz::exprish::level_succ_data(get_level_data(self.buf, self.offset, ptr)?)
+            == parse_u64(self.buf, pos).0
+          {
+            self.write_op(mode, LgzMode::Exprish, lgz::exprish::LEVEL_SUCC);
+            self.write_obj(ptr, LgzMode::Exprish);
+            return Some(())
+          }
+          None
+        })()
+        .or_else(|| {
+          // Expr.fvar
+          let hash = get_name_hash(self.buf, self.offset, ptr)?;
+          if lgz::exprish::expr_fvar_data(hash) == parse_u64(self.buf, pos).0 {
+            self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_FVAR);
+            self.write_obj(ptr, LgzMode::Exprish);
+            return Some(())
+          }
+          #[cfg(feature = "selftest")]
+          {
+            let mut out = vec![];
+            get_name(self.buf, self.offset, ptr, &mut out);
+            panic!(
+              "{_p0}: failed fvar hash: {hash:x} = {:x} != {:x} in {out:?}",
+              lgz::exprish::expr_fvar_data(hash),
+              parse_u64(self.buf, pos).0
+            )
+          }
+          #[cfg(not(feature = "selftest"))]
+          None
+        })
+      }
+      (2, 2, 1) => {
+        // Level.max
+        let (ptr1, pos) = parse_u64(self.buf, pos);
+        let (ptr2, pos) = parse_u64(self.buf, pos);
+        return (|| {
+          if lgz::exprish::level_max_data(
+            get_level_data(self.buf, self.offset, ptr1)?,
+            get_level_data(self.buf, self.offset, ptr2)?,
+          ) == parse_u64(self.buf, pos).0
+          {
+            self.write_op(mode, LgzMode::Exprish, lgz::exprish::LEVEL_MAX);
+            self.write_obj(ptr1, LgzMode::Exprish);
+            self.write_obj(ptr2, LgzMode::Exprish);
+            return Some(())
+          }
+          None
+        })()
+        .or_else(|| {
+          // Name.num
+          let h1 = get_name_hash(self.buf, self.offset, ptr1)?;
+          let h2 = if ptr2 & 1 == 1 { ptr2 >> 1 } else { 17 };
+          if mix_hash(h1, h2) == parse_u64(self.buf, pos).0 {
+            self.write_op(mode, LgzMode::Exprish, lgz::exprish::NAME_NUM);
+            self.write_obj(ptr1, LgzMode::Exprish);
+            self.write_obj(ptr2, LgzMode::Normal);
+            return Some(())
+          }
+          None
+        })
+      }
+      (3, 2, 1) => {
+        // Level.imax
+        let (ptr1, pos) = parse_u64(self.buf, pos);
+        let (ptr2, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::level_imax_data(
+          get_level_data(self.buf, self.offset, ptr1)?,
+          get_level_data(self.buf, self.offset, ptr2)?,
+        ) == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::LEVEL_IMAX);
+          self.write_obj(ptr1, LgzMode::Exprish);
+          self.write_obj(ptr2, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      (4, 1, 1) => {
+        // Level.param
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::level_param_data(get_name_hash(self.buf, self.offset, ptr)?)
+          == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::LEVEL_PARAM);
+          self.write_obj(ptr, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      (5, 1, 1) => {
+        // Level.mvar
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::level_mvar_data(get_name_hash(self.buf, self.offset, ptr)?)
+          == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::LEVEL_MVAR);
+          self.write_obj(ptr, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+
+      (0, 1, 1) => {
+        // Expr.bvar
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::expr_bvar_data(get_num_hash(self.buf, self.offset, ptr)?)
+          == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_BVAR);
+          self.write_obj(ptr, LgzMode::Normal);
+          return Some(())
+        }
+      }
+      (2, 1, 1) => {
+        // Expr.mvar
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::expr_mvar_data(get_name_hash(self.buf, self.offset, ptr)?)
+          == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_MVAR);
+          self.write_obj(ptr, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      (3, 1, 1) => {
+        // Expr.sort
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::expr_sort_data(get_level_data(self.buf, self.offset, ptr)?)
+          == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_SORT);
+          self.write_obj(ptr, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      // Expr.const, Expr.app
+      (4 | 5, 2, 1) => return self.parse_nary_app(pos, mode, ctor, num_fields, sfields),
+      (6 | 7, 3, 2) => {
+        // Expr.lam, Expr.forallE
+        let _p0 = pos - size_of::<ObjHeader>();
+        let (name, pos) = parse_u64(self.buf, pos);
+        let (ty, pos) = parse_u64(self.buf, pos);
+        let (body, pos) = parse_u64(self.buf, pos);
+        let (data, pos) = parse_u64(self.buf, pos);
+        let (bi, _) = parse_u64(self.buf, pos);
+        let data1 = get_expr_data(self.buf, self.offset, ty)?;
+        let data2 = get_expr_data(self.buf, self.offset, body)?;
+        if lgz::exprish::expr_binder_data(data1, data2) == data && bi & !3 == 0 {
+          self.write_op(mode, LgzMode::Exprish, (ctor << 2) + bi as u8);
+          self.write_obj(name, LgzMode::Exprish);
+          self.write_obj(ty, LgzMode::Exprish);
+          self.write_obj(body, LgzMode::Exprish);
+          return Some(())
+        }
+        #[cfg(feature = "selftest")]
+        panic!(
+          "{_p0}: failed binder data: {data1:x} + {data2:x} = {:x} != {data:x}",
+          lgz::exprish::expr_binder_data(data1, data2),
+        )
+      }
+      (8, 4, 2) => {
+        // Expr.letE
+        let (name, pos) = parse_u64(self.buf, pos);
+        let (ty, pos) = parse_u64(self.buf, pos);
+        let (value, pos) = parse_u64(self.buf, pos);
+        let (body, pos) = parse_u64(self.buf, pos);
+        let (data, pos) = parse_u64(self.buf, pos);
+        let (non_dep, _) = parse_u64(self.buf, pos);
+        if lgz::exprish::expr_let_data(
+          get_expr_data(self.buf, self.offset, ty)?,
+          get_expr_data(self.buf, self.offset, value)?,
+          get_expr_data(self.buf, self.offset, body)?,
+        ) == data
+          && non_dep & !1 == 0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_LET + non_dep as u8);
+          self.write_obj(name, LgzMode::Exprish);
+          self.write_obj(ty, LgzMode::Exprish);
+          self.write_obj(value, LgzMode::Exprish);
+          self.write_obj(body, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      (9, 1, 1) => {
+        // Expr.lit
+        let _p0 = pos - size_of::<ObjHeader>();
+        let (ptr, pos) = parse_u64(self.buf, pos);
+        let hash = get_lit_hash(self.buf, self.offset, ptr)?;
+        if lgz::exprish::expr_lit_data(hash) == parse_u64(self.buf, pos).0 {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_LIT);
+          self.write_obj(ptr, LgzMode::Normal);
+          return Some(())
+        }
+        #[cfg(feature = "selftest")]
+        panic!(
+          "{_p0}: failed lit data: {hash:x} = {:x} != {:x}",
+          lgz::exprish::expr_lit_data(hash),
+          parse_u64(self.buf, pos).0
+        )
+      }
+      (10, 2, 1) => {
+        // Expr.mdata
+        let (ptr1, pos) = parse_u64(self.buf, pos);
+        let (ptr2, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::expr_mdata_data(get_expr_data(self.buf, self.offset, ptr2)?)
+          == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_MDATA);
+          self.write_obj(ptr1, LgzMode::Normal);
+          self.write_obj(ptr2, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      (11, 3, 1) => {
+        // Expr.proj
+        let (ptr1, pos) = parse_u64(self.buf, pos);
+        let (ptr2, pos) = parse_u64(self.buf, pos);
+        let (ptr3, pos) = parse_u64(self.buf, pos);
+        if lgz::exprish::expr_proj_data(
+          get_name_hash(self.buf, self.offset, ptr1)?,
+          get_num_hash(self.buf, self.offset, ptr2)?,
+          get_expr_data(self.buf, self.offset, ptr3)?,
+        ) == parse_u64(self.buf, pos).0
+        {
+          self.write_op(mode, LgzMode::Exprish, lgz::exprish::EXPR_PROJ);
+          self.write_obj(ptr1, LgzMode::Exprish);
+          self.write_obj(ptr2, LgzMode::Normal);
+          self.write_obj(ptr3, LgzMode::Exprish);
+          return Some(())
+        }
+      }
+      _ => {}
+    }
+    None
+  }
+
+  fn write_obj(&mut self, ptr: u64, mode: LgzMode) {
     if ptr & 1 == 1 {
       self.write_i64(ptr as i64 >> 1);
       return
     }
     if let Some(&i) = self.backrefs.get(&ptr) {
-      self.file.write_all(&[lgz::BACKREF]).unwrap();
+      self.write_op(mode, mode, lgz::BACKREF);
       self.file.write_all(&i.to_le_bytes()).unwrap();
       return
     }
-    let save = self.refs[(ptr - self.offset) as usize >> 3] > 1;
+    let save = self.is_reused(ptr);
     if save {
-      self.file.write_all(&[lgz::SAVE]).unwrap();
+      self.write_op(mode, mode, lgz::SAVE);
     }
     let (header, mut pos) = parse::<ObjHeader>(self.buf, (ptr - self.offset) as usize);
+    // println!(
+    //   "{:d$}{:x}: write {:?}[{d}]({:x}) {:x?}, {}, {} (save = {save})",
+    //   "",
+    //   (ptr - self.offset + 0x20) as usize,
+    //   mode,
+    //   self.file.pos,
+    //   header.tag,
+    //   header.num_fields,
+    //   header.sfields(),
+    //   d = self.depth,
+    // );
+    self.depth += 1;
     match header.tag {
       tag::ARRAY => {
-        self.file.write_all(&[lgz::ARRAY]).unwrap();
+        self.write_op(mode, LgzMode::Normal, lgz::ARRAY);
         let (size, pos) = parse_u64(self.buf, pos);
         self.write_i64(size.try_into().unwrap());
         let (_capacity, mut pos) = parse_u64(self.buf, pos);
         for _ in 0..size {
           let (ptr2, pos2) = parse_u64(self.buf, pos);
-          self.write_obj(ptr2);
+          self.write_obj(ptr2, LgzMode::Normal);
           pos = pos2;
         }
       }
       tag::SCALAR_ARRAY => {
-        self.file.write_all(&[lgz::SCALAR_ARRAY]).unwrap();
+        self.write_op(mode, LgzMode::Normal, lgz::SCALAR_ARRAY);
         let (size, pos) = parse_u64(self.buf, pos);
         self.write_i64(size.try_into().unwrap());
         let (_capacity, pos) = parse_u64(self.buf, pos);
         self.file.write_all(&self.buf[pos..][..size as usize]).unwrap();
       }
       tag::STRING => {
-        self.file.write_all(&[lgz::STRING]).unwrap();
+        self.write_op(mode, LgzMode::Normal, lgz::STRING);
         let (size, pos) = parse_u64(self.buf, pos);
         let (_capacity, pos) = parse_u64(self.buf, pos);
         let (_length, pos) = parse_u64(self.buf, pos);
-        self.file.write_all(&self.buf[pos..][..size as usize]).unwrap();
+        let s = &self.buf[pos..][..size as usize];
+        let s2 = std::ffi::CStr::from_bytes_until_nul(s).unwrap().to_bytes_with_nul();
+        // println!("string: {:?}", std::str::from_utf8(s2).unwrap());
+        // Internal nulls are not supported, unclear whether lean allows this
+        assert!(s2.len() == s.len());
+        self.file.write_all(s2).unwrap();
       }
       tag::MPZ => {
-        self.file.write_all(&[lgz::MPZ]).unwrap();
+        self.write_op(mode, LgzMode::Normal, lgz::MPZ);
         let (capacity, pos) = parse_u32(self.buf, pos);
         let (sign_size, pos) = parse_u32(self.buf, pos);
         self.write_i64(sign_size.into());
@@ -376,84 +1073,111 @@ impl<W: Write> LgzWriter<'_, W> {
         self.file.write_all(&self.buf[pos..][..8 * capacity as usize]).unwrap();
       }
       tag::THUNK | tag::TASK | tag::REF => {
-        self.file.write_all(&[header.tag]).unwrap();
+        self.write_op(mode, LgzMode::Normal, header.tag);
         let (value, _) = parse_u64(self.buf, pos);
-        self.write_obj(value);
+        self.write_obj(value, LgzMode::Normal);
       }
       tag::CLOSURE | tag::STRUCT_ARRAY | tag::EXTERNAL | tag::RESERVED => unreachable!(),
       ctor => {
         let sfields = (header.cs_sz.get() >> 3) - 1 - (header.num_fields as u16);
-        if let Some(packed) = lgz::pack_ctor(ctor, header.num_fields, sfields) {
-          self.file.write_all(&[packed]).unwrap();
-        } else {
-          self.file.write_all(&[lgz::BIG_CTOR, ctor, header.num_fields]).unwrap();
-          self.file.write_all(&sfields.to_le_bytes()).unwrap();
+        if !ENABLE_EXPRISH
+          || self.try_write_exprish_ctor(pos, mode, ctor, header.num_fields, sfields).is_none()
+        {
+          if let Some(packed) = lgz::pack_ctor(ctor, header.num_fields, sfields) {
+            self.write_op(mode, LgzMode::Normal, packed);
+          } else {
+            self.write_op(mode, LgzMode::Normal, lgz::BIG_CTOR);
+            self.file.write_all(&[ctor, header.num_fields]).unwrap();
+            self.file.write_all(&sfields.to_le_bytes()).unwrap();
+          }
+          for _ in 0..header.num_fields {
+            let (ptr2, pos2) = parse_u64(self.buf, pos);
+            self.write_obj(ptr2, LgzMode::Normal);
+            pos = pos2;
+          }
+          self.file.write_all(&self.buf[pos..][..8 * sfields as usize]).unwrap();
         }
-        for _ in 0..header.num_fields {
-          let (ptr2, pos2) = parse_u64(self.buf, pos);
-          self.write_obj(ptr2);
-          pos = pos2;
-        }
-        self.file.write_all(&self.buf[pos..][..8 * sfields as usize]).unwrap();
       }
     }
+    self.depth -= 1;
+    // println!(
+    //   "{:d$}{:x}: <- write[{d}]({:x}) {:x?}",
+    //   "",
+    //   (ptr - self.offset + 0x20) as usize,
+    //   self.file.pos,
+    //   header.tag,
+    //   d = self.depth,
+    // );
     if save {
       self.backrefs.insert(ptr, self.backrefs.len().try_into().unwrap());
     }
   }
 }
 
-fn decompress(mut infile: impl Read, mut out: impl Write + Seek) {
+fn decompress(mut infile: impl Read) -> Vec<u8> {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
   assert_eq!(&magic, lgz::MAGIC);
   let mut file = flate2::read::GzDecoder::new(infile);
+  // let mut file = infile;
   let base = (file.read_u32::<LE>().unwrap() as u64) << 16;
-  out.write_all(b"oleanfile!!!!!!!").unwrap();
+  let mut out = b"oleanfile!!!!!!!".to_vec();
   out.write_u64::<LE>(base).unwrap();
   out.write_u64::<LE>(0).unwrap(); // fixed below
   let mut w = LgzDecompressor {
-    file,
-    out,
-    pos: base + 32,
+    file: WithPosition { r: file, pos: 8 },
+    buf: out,
+    offset: base,
+    // depth: 0,
     backrefs: Default::default(),
     stack: vec![],
     temp: vec![],
   };
   let root = w.write_obj();
-  w.out.seek(SeekFrom::Start(24)).unwrap();
-  w.out.write_u64::<LE>(root).unwrap();
-  w.out.flush().unwrap();
+  LE::write_u64(&mut w.buf[24..], root);
+  w.buf
 }
 
-struct LgzDecompressor<R, W> {
-  file: R,
-  out: W,
+struct WithPosition<R> {
+  r: R,
+  pos: usize,
+}
+impl<R: Read> Read for WithPosition<R> {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    let n = self.r.read(buf)?;
+    self.pos += n;
+    Ok(n)
+  }
+}
+struct LgzDecompressor<R> {
+  file: WithPosition<R>,
+  buf: Vec<u8>,
+  // depth: usize,
+  offset: u64,
   backrefs: Vec<u64>,
-  pos: u64,
   stack: Vec<U64<LE>>,
   temp: Vec<u8>,
 }
 
-impl<R: Read, W: Write> LgzDecompressor<R, W> {
-  fn write_header(&mut self, tag: u8, cs_sz: u16, num_fields: u8) {
+impl<R: Read> LgzDecompressor<R> {
+  fn pos(&self) -> u64 { self.offset + self.buf.len() as u64 }
+  fn write_header(&mut self, tag: u8, cs_sz: u16, num_fields: u8) -> u64 {
+    let pos = self.pos();
     let header = ObjHeader { rc: 0.into(), cs_sz: cs_sz.into(), num_fields, tag };
-    self.out.write_all(header.as_bytes()).unwrap();
-    self.pos += size_of::<ObjHeader>() as u64
+    self.buf.write_all(header.as_bytes()).unwrap();
+    pos
   }
 
   fn copy(&mut self, size: usize, size_padded: usize) {
     self.temp.resize(size, 0);
     self.file.read_exact(&mut self.temp).unwrap();
     self.temp.resize(size_padded, 0);
-    self.out.write_all(&self.temp).unwrap();
-    self.pos += self.temp.len() as u64;
+    self.buf.write_all(&self.temp).unwrap();
   }
 
   fn pop(&mut self, start: usize) {
     let buf = &self.stack[start..].as_bytes();
-    self.out.write_all(buf).unwrap();
-    self.pos += buf.len() as u64;
+    self.buf.write_all(buf).unwrap();
     self.stack.truncate(start);
   }
 
@@ -470,14 +1194,12 @@ impl<R: Read, W: Write> LgzDecompressor<R, W> {
     }
   }
 
-  fn write_u32(&mut self, n: u32) {
-    self.out.write_u32::<LE>(n).unwrap();
-    self.pos += 4;
-  }
+  fn write_u32(&mut self, n: u32) { self.buf.write_u32::<LE>(n).unwrap(); }
 
-  fn write_u64(&mut self, n: u64) {
-    self.out.write_u64::<LE>(n).unwrap();
-    self.pos += 8;
+  fn write_u64(&mut self, n: u64) { self.buf.write_u64::<LE>(n).unwrap(); }
+
+  fn write_ctor_header(&mut self, ctor: u8, num_fields: u8, sfields: u16) -> u64 {
+    self.write_header(ctor, (num_fields as u16 + 1 + sfields) << 3, num_fields)
   }
 
   fn write_ctor(&mut self, ctor: u8, num_fields: u8, sfields: u16) -> u64 {
@@ -486,8 +1208,7 @@ impl<R: Read, W: Write> LgzDecompressor<R, W> {
       let value = self.write_obj();
       self.stack.push(value.into());
     }
-    let pos = self.pos;
-    self.write_header(ctor, (num_fields as u16 + 1 + sfields) << 3, num_fields);
+    let pos = self.write_ctor_header(ctor, num_fields, sfields);
     self.pop(start);
     let size = (sfields << 3) as usize;
     self.copy(size, size);
@@ -507,21 +1228,296 @@ impl<R: Read, W: Write> LgzDecompressor<R, W> {
         len += 1;
       }
     }
-    let pos = self.pos;
-    self.write_header(tag::STRING, 1, 0);
+    let pos = self.write_header(tag::STRING, 1, 0);
     self.write_u64(self.temp.len() as u64);
     self.write_u64(self.temp.len() as u64);
     self.write_u64(len);
+    // println!("{:d$}string: {:?}", "", std::str::from_utf8(&self.temp).unwrap(), d = self.depth);
     let (_, size2) = pad_to(self.temp.len(), 8);
     self.temp.resize(size2, 0);
-    self.out.write_all(&self.temp).unwrap();
-    self.pos += self.temp.len() as u64;
+    self.buf.append(&mut self.temp);
     pos
   }
 
+  fn write_exprish(&mut self) -> u64 {
+    let tag = self.file.read_u8().unwrap();
+    // let start = self.buf.len();
+    // println!(
+    //   "{:d$}{start:x}: write_exprish[{d}]({:x}) {tag:x}",
+    //   "",
+    //   self.file.pos - 1,
+    //   d = self.depth
+    // );
+    // self.depth += 1;
+    #[allow(clippy::match_overlapping_arm)]
+    let res = match tag {
+      lgz::exprish::NAME_STR => {
+        let ptr1 = self.write_exprish();
+        let ptr2 = self.write_obj();
+        let pos = self.write_ctor_header(1, 2, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(mix_hash(
+          get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
+          get_str_hash(&self.buf, self.offset, ptr2).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::NAME_NUM => {
+        let ptr1 = self.write_exprish();
+        let ptr2 = self.write_obj();
+        let pos = self.write_ctor_header(2, 2, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(mix_hash(
+          get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
+          if ptr2 & 1 == 1 { ptr2 >> 1 } else { 17 },
+        ));
+        pos
+      }
+
+      lgz::exprish::LEVEL_SUCC => {
+        let ptr = self.write_exprish();
+        let pos = self.write_ctor_header(1, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::level_succ_data(
+          get_level_data(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::LEVEL_MAX => {
+        let ptr1 = self.write_exprish();
+        let ptr2 = self.write_exprish();
+        let pos = self.write_ctor_header(2, 2, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(lgz::exprish::level_max_data(
+          get_level_data(&self.buf, self.offset, ptr1).unwrap(),
+          get_level_data(&self.buf, self.offset, ptr2).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::LEVEL_IMAX => {
+        let ptr1 = self.write_exprish();
+        let ptr2 = self.write_exprish();
+        let pos = self.write_ctor_header(3, 2, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(lgz::exprish::level_imax_data(
+          get_level_data(&self.buf, self.offset, ptr1).unwrap(),
+          get_level_data(&self.buf, self.offset, ptr2).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::LEVEL_PARAM => {
+        let ptr = self.write_exprish();
+        let pos = self.write_ctor_header(4, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::level_param_data(
+          get_name_hash(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::LEVEL_MVAR => {
+        let ptr = self.write_exprish();
+        let pos = self.write_ctor_header(5, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::level_mvar_data(
+          get_name_hash(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+
+      lgz::exprish::EXPR_BVAR => {
+        let ptr = self.write_obj();
+        let pos = self.write_ctor_header(0, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::expr_bvar_data(
+          get_num_hash(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::EXPR_FVAR => {
+        let ptr = self.write_exprish();
+        let pos = self.write_ctor_header(1, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::expr_fvar_data(
+          get_name_hash(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::EXPR_MVAR => {
+        let ptr = self.write_exprish();
+        let pos = self.write_ctor_header(2, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::expr_mvar_data(
+          get_name_hash(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::EXPR_SORT => {
+        let ptr = self.write_exprish();
+        let pos = self.write_ctor_header(3, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::expr_sort_data(
+          get_level_data(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::EXPR_LIT => {
+        let ptr = self.write_obj();
+        let pos = self.write_ctor_header(9, 1, 1);
+        self.write_u64(ptr);
+        self.write_u64(lgz::exprish::expr_lit_data(
+          get_lit_hash(&self.buf, self.offset, ptr).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::EXPR_MDATA => {
+        let ptr1 = self.write_obj();
+        let ptr2 = self.write_exprish();
+        let pos = self.write_ctor_header(10, 2, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(lgz::exprish::expr_mdata_data(
+          get_expr_data(&self.buf, self.offset, ptr2).unwrap(),
+        ));
+        pos
+      }
+      lgz::exprish::EXPR_PROJ => {
+        let ptr1 = self.write_exprish();
+        let ptr2 = self.write_obj();
+        let ptr3 = self.write_exprish();
+        let pos = self.write_ctor_header(11, 3, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(ptr3);
+        self.write_u64(lgz::exprish::expr_proj_data(
+          get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
+          get_num_hash(&self.buf, self.offset, ptr2).unwrap(),
+          get_expr_data(&self.buf, self.offset, ptr3).unwrap(),
+        ));
+        pos
+      }
+      tag @ lgz::exprish::EXPR_LET..=lgz::exprish::EXPR_LET_END => {
+        let name = self.write_exprish();
+        let ty = self.write_exprish();
+        let value = self.write_exprish();
+        let body = self.write_exprish();
+        let pos = self.write_ctor_header(8, 4, 2);
+        self.write_u64(name);
+        self.write_u64(ty);
+        self.write_u64(value);
+        self.write_u64(body);
+        self.write_u64(lgz::exprish::expr_let_data(
+          get_expr_data(&self.buf, self.offset, ty).unwrap(),
+          get_expr_data(&self.buf, self.offset, value).unwrap(),
+          get_expr_data(&self.buf, self.offset, body).unwrap(),
+        ));
+        self.write_u64((tag & 1) as u64);
+        pos
+      }
+      tag @ lgz::exprish::EXPR_LAMBDA..=lgz::exprish::EXPR_FORALL_END => {
+        let name = self.write_exprish();
+        let ty = self.write_exprish();
+        let body = self.write_exprish();
+        let pos = self.write_ctor_header(tag >> 2, 3, 2);
+        self.write_u64(name);
+        self.write_u64(ty);
+        self.write_u64(body);
+        self.write_u64(lgz::exprish::expr_binder_data(
+          get_expr_data(&self.buf, self.offset, ty).unwrap(),
+          get_expr_data(&self.buf, self.offset, body).unwrap(),
+        ));
+        self.write_u64((tag & 3) as u64);
+        pos
+      }
+      ..=lgz::exprish::EXPR_APP => unreachable!(),
+      tag @ ..=lgz::exprish::EXPR_APP_END => {
+        let mut pos = self.write_exprish();
+        let mut data = get_expr_data(&self.buf, self.offset, pos).unwrap();
+        for _ in 0..tag & 0x1f {
+          let ptr2 = self.write_exprish();
+          let pos2 = self.write_ctor_header(5, 2, 1);
+          let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
+          data = lgz::exprish::expr_app_data(data, data2);
+          self.write_u64(pos);
+          self.write_u64(ptr2);
+          self.write_u64(data);
+          pos = pos2
+        }
+        pos
+      }
+      tag @ lgz::exprish::EXPR_CONST_APP..=lgz::exprish::EXPR_CONST_APP_END => {
+        let ptr1 = self.write_exprish();
+        let hash1 = get_name_hash(&self.buf, self.offset, ptr1).unwrap();
+        let ptr2 = self.write_obj();
+        let (hash2, bits2) = get_list_level_data(&self.buf, self.offset, ptr2);
+        let mut data = lgz::exprish::expr_const_data(hash1, hash2, bits2);
+        let mut pos = self.write_ctor_header(4, 2, 1);
+        self.write_u64(ptr1);
+        self.write_u64(ptr2);
+        self.write_u64(data);
+        for _ in 0..tag & 0x1f {
+          let ptr2 = self.write_exprish();
+          let pos2 = self.write_ctor_header(5, 2, 1);
+          let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
+          data = lgz::exprish::expr_app_data(data, data2);
+          self.write_u64(pos);
+          self.write_u64(ptr2);
+          self.write_u64(data);
+          pos = pos2
+        }
+        pos
+      }
+      lgz::exprish::NORMAL => {
+        println!("!!!");
+        self.write_obj()
+      }
+      ..=0xdf => unreachable!(),
+      tag @ ..=0xf3 => (self.read_i64(tag) << 1 | 1) as u64,
+      lgz::SAVE => {
+        // self.depth -= 1;
+        let pos = self.write_exprish();
+        self.backrefs.push(pos);
+        return pos
+      }
+      lgz::BACKREF => {
+        let r = self.file.read_u32::<LE>().unwrap();
+        self.backrefs[r as usize]
+      }
+      _ => unreachable!(),
+    };
+    // self.depth -= 1;
+    // println!(
+    //   "{:d$}{start:x}: write_exprish[{d}]({:x}) {tag:x} -> {:x?} -> {:x}",
+    //   "",
+    //   self.file.pos,
+    //   if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) },
+    //   self.buf.len(),
+    //   d = self.depth,
+    // );
+    res
+  }
+
   fn write_obj(&mut self) -> u64 {
-    match self.file.read_u8().unwrap() {
+    let tag = self.file.read_u8().unwrap();
+    // let start = self.buf.len();
+    // println!(
+    //   "{:d$}{start:x}: write_obj[{d}]({:x}) {tag:x} = {:?}, {:?}",
+    //   "",
+    //   self.file.pos - 1,
+    //   tag >> 4,
+    //   lgz::unpack_ctor(tag),
+    //   d = self.depth,
+    // );
+    // self.depth += 1;
+    match tag {
       tag @ ..=0xdf => {
+        const _X: (u8, (u8, u16)) = {
+          let tag = 0x15;
+          (tag >> 4, lgz::unpack_ctor(tag))
+        };
         let ctor = tag >> 4;
         let (num_fields, sfields) = lgz::unpack_ctor(tag);
         self.write_ctor(ctor, num_fields, sfields)
@@ -550,8 +1546,7 @@ impl<R: Read, W: Write> LgzDecompressor<R, W> {
           let value = self.write_obj();
           self.stack.push(value.into());
         }
-        let pos = self.pos;
-        self.write_header(tag::ARRAY, 1, 0);
+        let pos = self.write_header(tag::ARRAY, 1, 0);
         self.write_u64(size);
         self.write_u64(size);
         self.pop(start);
@@ -560,8 +1555,7 @@ impl<R: Read, W: Write> LgzDecompressor<R, W> {
       lgz::SCALAR_ARRAY => {
         let tag = self.file.read_u8().unwrap();
         let size = self.read_i64(tag) as u64;
-        let pos = self.pos;
-        self.write_header(tag::SCALAR_ARRAY, 1, 0);
+        let pos = self.write_header(tag::SCALAR_ARRAY, 1, 0);
         self.write_u64(size);
         self.write_u64(size);
         let (_, size2) = pad_to(size as usize, 8);
@@ -573,31 +1567,38 @@ impl<R: Read, W: Write> LgzDecompressor<R, W> {
         let tag = self.file.read_u8().unwrap();
         let sign_size = self.read_i64(tag) as i32;
         let capacity = sign_size as u32 & 0x7FFFFFFF;
-        let pos = self.pos;
-        self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
+        let pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
         self.write_u32(capacity);
         self.write_u32(sign_size as u32);
-        self.write_u64(self.pos + 8);
+        self.write_u64(self.pos() + 8);
         let size = (capacity as usize) << 3;
         self.copy(size, size);
         pos
       }
       tag @ (lgz::THUNK | lgz::TASK) => {
         let value = self.write_obj();
-        let pos = self.pos;
-        self.write_header(tag, 1, 0);
+        let pos = self.write_header(tag, 1, 0);
         self.write_u64(value);
         self.write_u64(0);
         pos
       }
       lgz::REF => {
         let value = self.write_obj();
-        let pos = self.pos;
-        self.write_header(tag::TASK, 1, 0);
+        let pos = self.write_header(tag::TASK, 1, 0);
         self.write_u64(value);
         pos
       }
-      244 | 254 => unreachable!(),
+      lgz::EXPRISH => self.write_exprish(),
+      0xf4 => unreachable!(),
     }
+    // self.depth -= 1;
+    // println!(
+    //   "{:d$}{start:x}: write_obj[{d}]({:x}) {tag:x} -> {:x?} -> {:x}",
+    //   "",
+    //   self.file.pos,
+    //   if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) },
+    //   self.buf.len(),
+    //   d = self.depth,
+    // );
   }
 }
