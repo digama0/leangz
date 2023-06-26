@@ -7,7 +7,9 @@ edition = "2021"
 
 [features]
 debug = []
-default = ["zstd"]
+zstd-train = ["zstd", "zstd/zdict_builder"]
+zstd-dict = ["zstd"]
+default = ["zstd", "zstd-dict"]
 
 [dependencies]
 memmap2 = "0.7"
