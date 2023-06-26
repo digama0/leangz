@@ -8,25 +8,51 @@ use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
+#[cfg(feature = "debug")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy::{AsBytes, FromBytes, LayoutVerified, LE, U16, U32, U64};
 
 const ENABLE_EXPRISH: bool = true;
 
+#[cfg(feature = "debug")]
+struct Stats {
+  normal: [AtomicUsize; 256],
+  exprish: [AtomicUsize; 256],
+}
+
+#[cfg(feature = "debug")]
+static STATS: Stats = {
+  #[allow(clippy::declare_interior_mutable_const)]
+  const NEW: AtomicUsize = AtomicUsize::new(0);
+  Stats { normal: [NEW; 256], exprish: [NEW; 256] }
+};
+
 fn main() {
   let help = || panic!("usage: leangz FILE.olean");
   let mut do_decompress = false;
-  #[cfg(feature = "selftest")]
+  #[cfg(feature = "debug")]
   let mut do_selftest = false;
-  // let mut file = None;
+  #[cfg(feature = "debug")]
+  let mut do_stats = false;
+  let mut verbose = false;
   let mut outfile = None;
   let mut args = std::env::args();
   args.next();
   let mut args = args.peekable();
   while let Some(arg) = args.peek() {
     match &**arg {
-      #[cfg(feature = "selftest")]
-      "-s" => {
+      "-v" => {
+        verbose = true;
+        args.next();
+      }
+      #[cfg(feature = "debug")]
+      "-t" => {
         do_selftest = true;
+        args.next();
+      }
+      #[cfg(feature = "debug")]
+      "-s" => {
+        do_stats = true;
         args.next();
       }
       "-d" | "-x" => {
@@ -42,28 +68,60 @@ fn main() {
       _ => break,
     }
   }
-  #[cfg(feature = "selftest")]
+  #[cfg(feature = "debug")]
   if do_selftest {
+    let mut lgzs = 0;
+    let mut oleans = 0;
     for file in args {
       println!("{file}");
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
-      let mut lgzfile = std::io::Cursor::new(vec![]);
-      compress(&mmap, lgzfile.get_mut());
-      let oleanfile = decompress(lgzfile);
-      assert!(*mmap == *oleanfile)
+      let mut lgzfile = vec![];
+      compress(&mmap, std::io::Cursor::new(&mut lgzfile));
+      let oleanfile = decompress(std::io::Cursor::new(&lgzfile));
+      assert!(*mmap == *oleanfile);
+      lgzs += lgzfile.len();
+      oleans += oleanfile.len();
+      println!(
+        "{} / {} = {:.6}",
+        oleanfile.len(),
+        lgzfile.len(),
+        oleanfile.len() as f64 / lgzfile.len() as f64
+      );
     }
+    println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
+    return
+  }
+  #[cfg(feature = "debug")]
+  if do_stats {
+    let mut lgzs = 0;
+    let mut oleans = 0;
+    for file in args {
+      let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
+      let mut out = WithPosition { r: std::io::sink(), pos: 0 };
+      compress(&mmap, &mut out);
+      lgzs += mmap.len();
+      oleans += out.pos;
+    }
+    for (i, (n, e)) in STATS.normal.iter().zip(&STATS.exprish).enumerate() {
+      println!("{i:x}: normal {} exprish {}", n.load(Ordering::Relaxed), e.load(Ordering::Relaxed));
+    }
+    println!("{} / {} = {:.6}", lgzs, oleans, lgzs as f64 / oleans as f64);
     return
   }
   if do_decompress {
     for file in args {
-      println!("{file}");
+      if verbose {
+        println!("{file}");
+      }
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.olean"));
       let file = File::open(file).unwrap();
       std::fs::write(outfile, decompress(file)).unwrap()
     }
   } else {
     for file in args {
-      println!("{file}");
+      if verbose {
+        println!("{file}");
+      }
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.lgz"));
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
       compress(&mmap, BufWriter::new(File::create(outfile).unwrap()));
@@ -87,7 +145,10 @@ fn compress(olean: &[u8], mut outfile: impl Write) {
     pos = pad_to(pos, 8).1;
   }
   outfile.write_all(lgz::MAGIC).unwrap();
+  #[cfg(feature = "flate2")]
   let outfile = flate2::write::GzEncoder::new(outfile, flate2::Compression::new(7));
+  #[cfg(feature = "zstd")]
+  let outfile = zstd::stream::Encoder::new(outfile, 19).unwrap();
   let mut w = LgzWriter {
     file: WithPosition { r: outfile, pos: 4 },
     refs: &refs,
@@ -98,8 +159,10 @@ fn compress(olean: &[u8], mut outfile: impl Write) {
   };
   w.file.write_all(&((base >> 16) as u32).to_le_bytes()).unwrap();
   w.write_obj(header.root.get(), LgzMode::Normal);
+  #[cfg(any(feature = "flate2", feature = "zstd"))]
   w.file.r.finish().unwrap();
-  // w.file.flush().unwrap();
+  #[cfg(not(any(feature = "flate2", feature = "zstd")))]
+  w.file.flush().unwrap();
 }
 
 #[repr(C, align(8))]
@@ -251,15 +314,6 @@ fn on_array_subobjs(buf: &[u8], size: u64, mut pos: usize, mut f: impl FnMut(u64
   pos
 }
 
-impl<W: Write> Write for WithPosition<W> {
-  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    let n = self.r.write(buf)?;
-    self.pos += n;
-    Ok(n)
-  }
-
-  fn flush(&mut self) -> std::io::Result<()> { self.r.flush() }
-}
 struct LgzWriter<'a, W> {
   buf: &'a [u8],
   file: WithPosition<W>,
@@ -273,30 +327,35 @@ mod lgz {
   pub(crate) const MAGIC: &[u8; 4] = b"LGZ!";
 
   // These are valid in normal and exprish mode
-  pub(crate) const UINT0: u8 = 0xe0;
-  pub(crate) const INT1: u8 = 0xf0;
-  pub(crate) const INT2: u8 = 0xf1;
-  pub(crate) const INT4: u8 = 0xf2;
-  pub(crate) const INT8: u8 = 0xf3;
-  pub(crate) const SAVE: u8 = 0xf5;
-  pub(crate) const BACKREF: u8 = 0xff;
+  pub(crate) const UINT0: u8 = 0xd0;
+  pub(crate) const UINT0_END: u8 = 0xef;
+  pub(crate) const BACKREF0: u8 = 0xf0;
+  pub(crate) const BACKREF0_END: u8 = 0xf7;
+  pub(crate) const INT1: u8 = 0xf8;
+  pub(crate) const INT2: u8 = 0xf9;
+  pub(crate) const INT4: u8 = 0xfa;
+  pub(crate) const INT8: u8 = 0xfb;
+  pub(crate) const BACKREF1: u8 = 0xfc;
+  pub(crate) const BACKREF2: u8 = 0xfd;
+  pub(crate) const BACKREF4: u8 = 0xfe;
+  pub(crate) const SAVE: u8 = 0xff;
 
   // only valid in normal mode
-  pub(crate) const ARRAY: u8 = 0xf6;
-  pub(crate) const BIG_CTOR: u8 = 0xf7;
-  pub(crate) const SCALAR_ARRAY: u8 = 0xf8;
-  pub(crate) const STRING: u8 = 0xf9;
-  pub(crate) const MPZ: u8 = 0xfa;
-  pub(crate) const THUNK: u8 = super::tag::THUNK;
-  pub(crate) const TASK: u8 = super::tag::TASK;
-  pub(crate) const REF: u8 = super::tag::REF;
-  pub(crate) const EXPRISH: u8 = 0xfe;
+  pub(crate) const ARRAY: u8 = 0x00;
+  pub(crate) const BIG_CTOR: u8 = 0x10;
+  pub(crate) const SCALAR_ARRAY: u8 = 0x20;
+  pub(crate) const STRING: u8 = 0x30;
+  pub(crate) const MPZ: u8 = 0x40;
+  pub(crate) const THUNK: u8 = 0x50;
+  pub(crate) const TASK: u8 = 0x60;
+  pub(crate) const REF: u8 = 0x70;
+  pub(crate) const EXPRISH: u8 = 0x80;
 
   // only valid in exprish mode
   pub(crate) mod exprish {
     use crate::mix_hash;
 
-    pub(crate) const NORMAL: u8 = 0xaa;
+    pub(crate) const NORMAL: u8 = 0x20;
 
     pub(crate) const NAME_STR: u8 = 0x00;
     pub(crate) const NAME_NUM: u8 = 0x01;
@@ -350,7 +409,7 @@ mod lgz {
     pub(crate) const EXPR_LAMBDA: u8 = 0x18;
     pub(crate) const _EXPR_FORALL: u8 = 0x1c;
     pub(crate) const EXPR_FORALL_END: u8 = 0x1f;
-    pub(crate) const EXPR_APP: u8 = 0x20;
+    pub(crate) const EXPR_APP: u8 = 0x20; // 0x20 is not used, 0x20+n is n applications
     pub(crate) const EXPR_APP_END: u8 = EXPR_APP + 0x1f;
     pub(crate) const EXPR_CONST_APP: u8 = 0x40;
     pub(crate) const EXPR_CONST_APP_END: u8 = EXPR_CONST_APP + 0x1f;
@@ -415,36 +474,26 @@ mod lgz {
   }
 
   pub(crate) const fn pack_ctor(ctor: u8, num_fields: u8, sfields: u16) -> Option<u8> {
-    // This encoding works for all constructors in the Lean library, and in particular
-    // covers all the Expr constructors that make up the majority of oleans.
-    if ctor >= 14 {
-      return None
-    }
-    let lo = match (num_fields, sfields) {
-      (4, 2) => 0,
-      (3, 2) => 14,
-      (0, 0) | (7, 0) => return None,
-      (..=7, ..=1) => num_fields << 1 | sfields as u8,
+    // This encoding works for all constructors in the Lean library
+    let lo = match (ctor, num_fields, sfields) {
+      (_, 0, 0) => return None, // unused anyway because these are enum-like
+      (..=12, ..=7, ..=1) => num_fields << 1 | sfields as u8,
       _ => return None,
     };
     Some(ctor << 4 | lo)
   }
   pub(crate) const fn unpack_ctor(tag: u8) -> (u8, u16) {
-    match tag & 15 {
-      0 => (4, 2),
-      14 => (3, 2),
-      n => (n >> 1, (n & 1) as u16),
-    }
+    let n = tag & 15;
+    (n >> 1, (n & 1) as u16)
   }
 
   const _: () = {
     let mut i = 0;
-    while i < 0xe0 {
+    while i < 0xff {
       let ctor = i >> 4;
       let (n, s) = unpack_ctor(i);
-      match pack_ctor(ctor, n, s) {
-        Some(val) if val == i => {}
-        _ => [][0],
+      if let Some(val) = pack_ctor(ctor, n, s) {
+        assert!(val == i)
       }
       i += 1;
     }
@@ -514,7 +563,7 @@ fn get_num_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   }
 }
 
-#[cfg(feature = "selftest")]
+#[cfg(feature = "debug")]
 fn get_str(buf: &[u8], offset: u64, ptr: u64) -> &str {
   if ptr & 1 == 0 {
     let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
@@ -526,7 +575,7 @@ fn get_str(buf: &[u8], offset: u64, ptr: u64) -> &str {
   panic!()
 }
 
-#[cfg(feature = "selftest")]
+#[cfg(feature = "debug")]
 fn get_name<'a>(buf: &'a [u8], offset: u64, ptr: u64, out: &mut Vec<Result<&'a str, u64>>) {
   if ptr & 1 == 1 {
     if (ptr >> 1) == 0 {
@@ -635,33 +684,53 @@ fn get_list_level_data(buf: &[u8], offset: u64, mut ptr: u64) -> (u64, u8) {
 }
 
 impl<W: Write> LgzWriter<'_, W> {
-  fn write_i64(&mut self, num: i64) {
-    if (0..16).contains(&num) {
-      self.file.write_all(&[lgz::UINT0 | num as u8]).unwrap();
+  fn write_i64(&mut self, mode: LgzMode, num: i64) {
+    if (0..32).contains(&num) {
+      self.write_op(mode, mode, lgz::UINT0 + num as u8);
     } else if let Ok(i) = i8::try_from(num) {
-      self.file.write_all(&[lgz::INT1]).unwrap();
+      self.write_op(mode, mode, lgz::INT1);
       self.file.write_all(&i.to_le_bytes()).unwrap();
     } else if let Ok(i) = i16::try_from(num) {
-      self.file.write_all(&[lgz::INT2]).unwrap();
+      self.write_op(mode, mode, lgz::INT2);
       self.file.write_all(&i.to_le_bytes()).unwrap();
     } else if let Ok(i) = i32::try_from(num) {
-      self.file.write_all(&[lgz::INT4]).unwrap();
+      self.write_op(mode, mode, lgz::INT4);
       self.file.write_all(&i.to_le_bytes()).unwrap();
     } else {
-      self.file.write_all(&[lgz::INT8]).unwrap();
+      self.write_op(mode, mode, lgz::INT8);
       self.file.write_all(&num.to_le_bytes()).unwrap();
+    }
+  }
+
+  fn write_backref(&mut self, mode: LgzMode, num: u32) {
+    if (0..8).contains(&num) {
+      self.write_op(mode, mode, lgz::BACKREF0 + num as u8);
+    } else if let Ok(i) = u8::try_from(num) {
+      self.write_op(mode, mode, lgz::BACKREF1);
+      self.file.write_u8(i).unwrap();
+    } else if let Ok(i) = u16::try_from(num) {
+      self.write_op(mode, mode, lgz::BACKREF2);
+      self.file.write_u16::<LE>(i).unwrap();
+    } else {
+      self.write_op(mode, mode, lgz::BACKREF4);
+      self.file.write_u32::<LE>(num).unwrap();
     }
   }
 
   fn is_reused(&mut self, ptr: u64) -> bool { self.refs[(ptr - self.offset) as usize >> 3] > 1 }
 
   fn write_op(&mut self, cur_mode: LgzMode, mode: LgzMode, op: u8) {
+    #[cfg(feature = "debug")]
+    match mode {
+      LgzMode::Normal => STATS.normal[op as usize].fetch_add(1, Ordering::Relaxed),
+      LgzMode::Exprish => STATS.exprish[op as usize].fetch_add(1, Ordering::Relaxed),
+    };
     match (cur_mode, mode) {
       (LgzMode::Normal, LgzMode::Exprish) => self.file.write_all(&[lgz::EXPRISH, op]).unwrap(),
       (LgzMode::Exprish, LgzMode::Normal) => {
-        #[cfg(feature = "selftest")]
-        panic!("!!! {:x}", self.file.pos);
-        #[cfg(not(feature = "selftest"))]
+        #[cfg(feature = "debug")]
+        panic!("non-expr in expr");
+        #[cfg(not(feature = "debug"))]
         self.file.write_all(&[lgz::exprish::NORMAL, op]).unwrap()
       }
       _ => self.file.write_all(&[op]).unwrap(),
@@ -692,14 +761,14 @@ impl<W: Write> LgzWriter<'_, W> {
             }
             return Some(())
           }
-          #[cfg(feature = "selftest")]
+          #[cfg(feature = "debug")]
           panic!(
             "{_p0}: failed const data: {hash1:x} + {hash2:x} + {bits2:x} = {:x} != {:x}",
             lgz::exprish::expr_const_data(hash1, hash2, bits2),
             parse_u64(self.buf, pos).0
           )
         }
-        (pos, 5, 2, 1) if stack.len() < 0x20 => {
+        (pos, 5, 2, 1) if stack.len() < 0x1f => {
           // Expr.app
           let _p0 = pos - size_of::<ObjHeader>();
           let (ptr1, pos) = parse_u64(self.buf, pos);
@@ -714,15 +783,14 @@ impl<W: Write> LgzWriter<'_, W> {
               state = (pos, header.tag, header.num_fields, header.sfields());
               continue
             }
+            break
           }
-          #[cfg(feature = "selftest")]
-          {
-            panic!(
-              "{_p0}: failed app data: {data1:x} + {data2:x} = {:x} != {:x}",
-              lgz::exprish::expr_app_data(data1, data2),
-              parse_u64(self.buf, pos).0,
-            )
-          }
+          #[cfg(feature = "debug")]
+          panic!(
+            "{_p0}: failed app data: {data1:x} + {data2:x} = {:x} != {:x}",
+            lgz::exprish::expr_app_data(data1, data2),
+            parse_u64(self.buf, pos).0,
+          )
         }
         _ => {}
       }
@@ -741,6 +809,7 @@ impl<W: Write> LgzWriter<'_, W> {
   fn try_write_exprish_ctor(
     &mut self, pos: usize, mode: LgzMode, ctor: u8, num_fields: u8, sfields: u16,
   ) -> Option<()> {
+    // let res = (|| {
     match (ctor, num_fields, sfields) {
       // Name.anonymous, Level.zero not needed because it is a scalar
       (1, 2, 1) => {
@@ -756,7 +825,7 @@ impl<W: Write> LgzWriter<'_, W> {
           self.write_obj(ptr2, LgzMode::Normal);
           return Some(())
         }
-        #[cfg(feature = "selftest")]
+        #[cfg(feature = "debug")]
         {
           let mut out = vec![];
           get_name(self.buf, self.offset, ptr1, &mut out);
@@ -790,7 +859,7 @@ impl<W: Write> LgzWriter<'_, W> {
             self.write_obj(ptr, LgzMode::Exprish);
             return Some(())
           }
-          #[cfg(feature = "selftest")]
+          #[cfg(feature = "debug")]
           {
             let mut out = vec![];
             get_name(self.buf, self.offset, ptr, &mut out);
@@ -800,7 +869,7 @@ impl<W: Write> LgzWriter<'_, W> {
               parse_u64(self.buf, pos).0
             )
           }
-          #[cfg(not(feature = "selftest"))]
+          #[cfg(not(feature = "debug"))]
           None
         })
       }
@@ -924,7 +993,7 @@ impl<W: Write> LgzWriter<'_, W> {
           self.write_obj(body, LgzMode::Exprish);
           return Some(())
         }
-        #[cfg(feature = "selftest")]
+        #[cfg(feature = "debug")]
         panic!(
           "{_p0}: failed binder data: {data1:x} + {data2:x} = {:x} != {data:x}",
           lgz::exprish::expr_binder_data(data1, data2),
@@ -963,7 +1032,7 @@ impl<W: Write> LgzWriter<'_, W> {
           self.write_obj(ptr, LgzMode::Normal);
           return Some(())
         }
-        #[cfg(feature = "selftest")]
+        #[cfg(feature = "debug")]
         panic!(
           "{_p0}: failed lit data: {hash:x} = {:x} != {:x}",
           lgz::exprish::expr_lit_data(hash),
@@ -1004,16 +1073,28 @@ impl<W: Write> LgzWriter<'_, W> {
       _ => {}
     }
     None
+    // })();
+    // println!(
+    //   "{:d$}{:x}: try_write_exprish_ctor {:?}[{d}]({:x}) {:x?}, {}, {} -> {res:?}",
+    //   "",
+    //   pos - size_of::<ObjHeader>(),
+    //   mode,
+    //   self.file.pos,
+    //   ctor,
+    //   num_fields,
+    //   sfields,
+    //   d = self.depth,
+    // );
+    // res
   }
 
   fn write_obj(&mut self, ptr: u64, mode: LgzMode) {
     if ptr & 1 == 1 {
-      self.write_i64(ptr as i64 >> 1);
+      self.write_i64(mode, ptr as i64 >> 1);
       return
     }
     if let Some(&i) = self.backrefs.get(&ptr) {
-      self.write_op(mode, mode, lgz::BACKREF);
-      self.file.write_all(&i.to_le_bytes()).unwrap();
+      self.write_backref(mode, i);
       return
     }
     let save = self.is_reused(ptr);
@@ -1037,7 +1118,7 @@ impl<W: Write> LgzWriter<'_, W> {
       tag::ARRAY => {
         self.write_op(mode, LgzMode::Normal, lgz::ARRAY);
         let (size, pos) = parse_u64(self.buf, pos);
-        self.write_i64(size.try_into().unwrap());
+        self.write_i64(LgzMode::Normal, size.try_into().unwrap());
         let (_capacity, mut pos) = parse_u64(self.buf, pos);
         for _ in 0..size {
           let (ptr2, pos2) = parse_u64(self.buf, pos);
@@ -1048,7 +1129,7 @@ impl<W: Write> LgzWriter<'_, W> {
       tag::SCALAR_ARRAY => {
         self.write_op(mode, LgzMode::Normal, lgz::SCALAR_ARRAY);
         let (size, pos) = parse_u64(self.buf, pos);
-        self.write_i64(size.try_into().unwrap());
+        self.write_i64(LgzMode::Normal, size.try_into().unwrap());
         let (_capacity, pos) = parse_u64(self.buf, pos);
         self.file.write_all(&self.buf[pos..][..size as usize]).unwrap();
       }
@@ -1068,7 +1149,7 @@ impl<W: Write> LgzWriter<'_, W> {
         self.write_op(mode, LgzMode::Normal, lgz::MPZ);
         let (capacity, pos) = parse_u32(self.buf, pos);
         let (sign_size, pos) = parse_u32(self.buf, pos);
-        self.write_i64(sign_size.into());
+        self.write_i64(LgzMode::Normal, sign_size.into());
         let (_limbs_ptr, pos) = parse_u64(self.buf, pos);
         self.file.write_all(&self.buf[pos..][..8 * capacity as usize]).unwrap();
       }
@@ -1118,14 +1199,17 @@ fn decompress(mut infile: impl Read) -> Vec<u8> {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
   assert_eq!(&magic, lgz::MAGIC);
-  let mut file = flate2::read::GzDecoder::new(infile);
+  #[cfg(feature = "flate2")]
+  let mut infile = flate2::read::GzDecoder::new(infile);
+  #[cfg(feature = "zstd")]
+  let mut infile = zstd::stream::Decoder::new(infile).unwrap();
   // let mut file = infile;
-  let base = (file.read_u32::<LE>().unwrap() as u64) << 16;
+  let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
   let mut out = b"oleanfile!!!!!!!".to_vec();
   out.write_u64::<LE>(base).unwrap();
   out.write_u64::<LE>(0).unwrap(); // fixed below
   let mut w = LgzDecompressor {
-    file: WithPosition { r: file, pos: 8 },
+    file: WithPosition { r: infile, pos: 8 },
     buf: out,
     offset: base,
     // depth: 0,
@@ -1148,7 +1232,30 @@ impl<R: Read> Read for WithPosition<R> {
     self.pos += n;
     Ok(n)
   }
+
+  fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    self.r.read_exact(buf)?;
+    self.pos += buf.len();
+    Ok(())
+  }
 }
+
+impl<W: Write> Write for WithPosition<W> {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    let n = self.r.write(buf)?;
+    self.pos += n;
+    Ok(n)
+  }
+
+  fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+    self.r.write_all(buf)?;
+    self.pos += buf.len();
+    Ok(())
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> { self.r.flush() }
+}
+
 struct LgzDecompressor<R> {
   file: WithPosition<R>,
   buf: Vec<u8>,
@@ -1163,6 +1270,13 @@ impl<R: Read> LgzDecompressor<R> {
   fn pos(&self) -> u64 { self.offset + self.buf.len() as u64 }
   fn write_header(&mut self, tag: u8, cs_sz: u16, num_fields: u8) -> u64 {
     let pos = self.pos();
+    // let start = self.buf.len();
+    // println!(
+    //   "{:d$}{start:x}: write_header[{d}]({:x}) {tag:x}, {cs_sz}, {num_fields}",
+    //   "",
+    //   self.file.pos,
+    //   d = self.depth
+    // );
     let header = ObjHeader { rc: 0.into(), cs_sz: cs_sz.into(), num_fields, tag };
     self.buf.write_all(header.as_bytes()).unwrap();
     pos
@@ -1177,20 +1291,40 @@ impl<R: Read> LgzDecompressor<R> {
 
   fn pop(&mut self, start: usize) {
     let buf = &self.stack[start..].as_bytes();
+    // println!(
+    //   "{:d$}{:x}: pop[{d}]({:x}) {:x?}",
+    //   "",
+    //   self.buf.len(),
+    //   self.file.pos,
+    //   self.stack[start..]
+    //     .iter()
+    //     .map(|res| res.get())
+    //     .map(|res| if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) })
+    //     .collect::<Vec<_>>(),
+    //   d = self.depth
+    // );
     self.buf.write_all(buf).unwrap();
     self.stack.truncate(start);
   }
 
   fn read_i64(&mut self, tag: u8) -> i64 {
-    if tag & !15 == lgz::UINT0 {
-      return (tag & 15).into()
-    }
     match tag {
+      lgz::UINT0..=lgz::UINT0_END => (tag - lgz::UINT0).into(),
       lgz::INT1 => self.file.read_i8().unwrap().into(),
       lgz::INT2 => self.file.read_i16::<LE>().unwrap().into(),
       lgz::INT4 => self.file.read_i32::<LE>().unwrap().into(),
       lgz::INT8 => self.file.read_i64::<LE>().unwrap(),
       _ => panic!("unexpected int"),
+    }
+  }
+
+  fn read_backref(&mut self, tag: u8) -> u32 {
+    match tag {
+      lgz::BACKREF0..=lgz::BACKREF0_END => (tag - lgz::BACKREF0).into(),
+      lgz::BACKREF1 => self.file.read_u8().unwrap().into(),
+      lgz::BACKREF2 => self.file.read_u16::<LE>().unwrap().into(),
+      lgz::BACKREF4 => self.file.read_u32::<LE>().unwrap(),
+      _ => panic!("unexpected backref"),
     }
   }
 
@@ -1251,6 +1385,11 @@ impl<R: Read> LgzDecompressor<R> {
     // self.depth += 1;
     #[allow(clippy::match_overlapping_arm)]
     let res = match tag {
+      lgz::exprish::NORMAL => {
+        // println!("!!!");
+        self.write_obj()
+      }
+
       lgz::exprish::NAME_STR => {
         let ptr1 = self.write_exprish();
         let ptr2 = self.write_obj();
@@ -1441,6 +1580,17 @@ impl<R: Read> LgzDecompressor<R> {
           let pos2 = self.write_ctor_header(5, 2, 1);
           let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
           data = lgz::exprish::expr_app_data(data, data2);
+          // println!(
+          //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
+          //   "",
+          //   self.buf.len(),
+          //   self.file.pos,
+          //   [pos, ptr2]
+          //     .iter()
+          //     .map(|res| if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) })
+          //     .collect::<Vec<_>>(),
+          //   d = self.depth
+          // );
           self.write_u64(pos);
           self.write_u64(ptr2);
           self.write_u64(data);
@@ -1463,6 +1613,17 @@ impl<R: Read> LgzDecompressor<R> {
           let pos2 = self.write_ctor_header(5, 2, 1);
           let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
           data = lgz::exprish::expr_app_data(data, data2);
+          // println!(
+          //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
+          //   "",
+          //   self.buf.len(),
+          //   self.file.pos,
+          //   [pos, ptr2]
+          //     .iter()
+          //     .map(|res| if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) })
+          //     .collect::<Vec<_>>(),
+          //   d = self.depth
+          // );
           self.write_u64(pos);
           self.write_u64(ptr2);
           self.write_u64(data);
@@ -1470,20 +1631,17 @@ impl<R: Read> LgzDecompressor<R> {
         }
         pos
       }
-      lgz::exprish::NORMAL => {
-        println!("!!!");
-        self.write_obj()
-      }
-      ..=0xdf => unreachable!(),
-      tag @ ..=0xf3 => (self.read_i64(tag) << 1 | 1) as u64,
+
+      tag @ (lgz::UINT0..=lgz::UINT0_END | lgz::INT1 | lgz::INT2 | lgz::INT4 | lgz::INT8) =>
+        (self.read_i64(tag) << 1 | 1) as u64,
       lgz::SAVE => {
         // self.depth -= 1;
         let pos = self.write_exprish();
         self.backrefs.push(pos);
         return pos
       }
-      lgz::BACKREF => {
-        let r = self.file.read_u32::<LE>().unwrap();
+      tag @ (lgz::BACKREF0..=lgz::BACKREF0_END | lgz::BACKREF1 | lgz::BACKREF2 | lgz::BACKREF4) => {
+        let r = self.read_backref(tag);
         self.backrefs[r as usize]
       }
       _ => unreachable!(),
@@ -1512,17 +1670,8 @@ impl<R: Read> LgzDecompressor<R> {
     //   d = self.depth,
     // );
     // self.depth += 1;
+    // let res =
     match tag {
-      tag @ ..=0xdf => {
-        const _X: (u8, (u8, u16)) = {
-          let tag = 0x15;
-          (tag >> 4, lgz::unpack_ctor(tag))
-        };
-        let ctor = tag >> 4;
-        let (num_fields, sfields) = lgz::unpack_ctor(tag);
-        self.write_ctor(ctor, num_fields, sfields)
-      }
-      tag @ ..=0xf3 => (self.read_i64(tag) << 1 | 1) as u64,
       lgz::BIG_CTOR => {
         let ctor = self.file.read_u8().unwrap();
         let num_fields = self.file.read_u8().unwrap();
@@ -1530,12 +1679,14 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_ctor(ctor, num_fields, sfields)
       }
       lgz::SAVE => {
+        // self.depth -= 1;
         let pos = self.write_obj();
         self.backrefs.push(pos);
+        // return
         pos
       }
-      lgz::BACKREF => {
-        let r = self.file.read_u32::<LE>().unwrap();
+      tag @ (lgz::BACKREF0..=lgz::BACKREF0_END | lgz::BACKREF1 | lgz::BACKREF2 | lgz::BACKREF4) => {
+        let r = self.read_backref(tag);
         self.backrefs[r as usize]
       }
       lgz::ARRAY => {
@@ -1588,8 +1739,22 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(value);
         pos
       }
-      lgz::EXPRISH => self.write_exprish(),
-      0xf4 => unreachable!(),
+      lgz::EXPRISH => {
+        // self.depth -= 1;
+        // return
+        self.write_exprish()
+      }
+      tag @ ..=0xcf => {
+        const _X: (u8, (u8, u16)) = {
+          let tag = 0x15;
+          (tag >> 4, lgz::unpack_ctor(tag))
+        };
+        let ctor = tag >> 4;
+        let (num_fields, sfields) = lgz::unpack_ctor(tag);
+        self.write_ctor(ctor, num_fields, sfields)
+      }
+      tag @ (lgz::UINT0..=lgz::UINT0_END | lgz::INT1 | lgz::INT2 | lgz::INT4 | lgz::INT8) =>
+        (self.read_i64(tag) << 1 | 1) as u64,
     }
     // self.depth -= 1;
     // println!(
@@ -1600,5 +1765,6 @@ impl<R: Read> LgzDecompressor<R> {
     //   self.buf.len(),
     //   d = self.depth,
     // );
+    // res
   }
 }
