@@ -49,6 +49,7 @@ pub fn compress(olean: &[u8], mut outfile: impl Write) {
     depth: 0,
   };
   w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
+  w.file.write_u64::<LE>(olean.len() as u64).unwrap();
   w.write_obj(header.root.get(), LgzMode::Normal);
 }
 
@@ -1087,7 +1088,8 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
   infile.read_exact(&mut magic).unwrap();
   assert_eq!(&magic, lgz::MAGIC);
   let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
-  let mut out = b"oleanfile!!!!!!!".to_vec();
+  let mut out = Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize);
+  out.write_all(b"oleanfile!!!!!!!").unwrap();
   out.write_u64::<LE>(base).unwrap();
   out.write_u64::<LE>(0).unwrap(); // fixed below
   let mut w = LgzDecompressor {
