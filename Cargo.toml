@@ -2,6 +2,7 @@
 name = "leangz"
 version = "0.1.0"
 edition = "2021"
+default-run = "leangz"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,8 +19,14 @@ zerocopy = "0.6"
 hashbrown = "0.14"
 flate2 = { version = "1.0", optional = true }
 zstd = { version = "0.12", optional = true }
+rayon = "1.7"
 
 [[bin]]
 name = "leangz"
 path = "src/main.rs"
+doc = false
+
+[[bin]]
+name = "leantar"
+path = "src/tar.rs"
 doc = false
