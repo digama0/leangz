@@ -47,7 +47,20 @@ fn main() {
   }
   let basedir = PathBuf::from(basedir.unwrap_or_else(|| format!(".")));
   if do_decompress {
-    args.collect::<Vec<_>>().into_par_iter().for_each(|tarfile| {
+    let mut from_stdin = false;
+    let mut args_vec = vec![];
+    for arg in args {
+      if arg == "-" {
+        assert!(!from_stdin, "two stdin inputs");
+        from_stdin = true;
+        for arg in std::io::stdin().lines() {
+          args_vec.push(arg.unwrap())
+        }
+      } else {
+        args_vec.push(arg)
+      }
+    }
+    args_vec.into_par_iter().for_each(|tarfile| {
       let mut tarfile = BufReader::new(File::open(tarfile).unwrap());
       let mut buf = vec![0; 4];
       tarfile.read_exact(&mut buf).unwrap();
