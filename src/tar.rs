@@ -10,6 +10,7 @@ use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 const COMPRESSION_LEVEL: i32 = 19;
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
@@ -80,12 +81,32 @@ fn main() {
       }
     }
 
-    args_vec.into_par_iter().for_each(|(basedir2, tarfile)| {
+    let mut error = AtomicBool::new(false);
+    let fail = || error.store(true, std::sync::atomic::Ordering::Relaxed);
+    args_vec.into_par_iter().for_each(|(basedir2, file)| {
+      if verbose {
+        println!("unpacking {file}");
+      }
       let basedir = basedir2.as_ref().unwrap_or(&basedir);
-      let mut tarfile = BufReader::new(File::open(tarfile).unwrap());
+      let mut tarfile = match File::open(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+          eprintln!("{file} not found");
+          return fail()
+        }
+        e => BufReader::new(e.unwrap()),
+      };
       let mut buf = vec![0; 4];
-      tarfile.read_exact(&mut buf).unwrap();
-      assert!(buf == *b"LTAR");
+      let is_ltar = match tarfile.read_exact(&mut buf) {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        e => {
+          e.unwrap();
+          buf == *b"LTAR"
+        }
+      };
+      if !is_ltar {
+        eprintln!("{file} is not a valid .ltar file");
+        return fail()
+      }
       let trace = tarfile.read_u64::<LE>().unwrap();
       let read_cstr = |buf: &mut Vec<_>, tarfile: &mut BufReader<File>| {
         buf.clear();
@@ -100,6 +121,8 @@ fn main() {
             return
           },
       }
+      let prefix = trace_path.parent().unwrap();
+      std::fs::create_dir_all(prefix).unwrap();
       std::fs::write(trace_path, format!("{trace}")).unwrap();
       let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
       while let Some(path) = read_cstr(&mut buf, &mut tarfile) {
@@ -125,7 +148,8 @@ fn main() {
           _ => panic!("unsupported compression {compression}"),
         }
       }
-    })
+    });
+    std::process::exit(*error.get_mut() as i32);
   } else {
     let tarfile = args.next().unwrap_or_else(help);
     let trace_path = args.next().unwrap_or_else(help);
