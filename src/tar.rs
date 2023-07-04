@@ -22,6 +22,8 @@ fn main() {
   let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
   let mut do_decompress = false;
   let mut verbose = false;
+  let mut from_stdin = false;
+  let mut json_stdin = true;
   let mut basedir = None;
   let mut args = std::env::args();
   args.next();
@@ -30,6 +32,10 @@ fn main() {
     match &**arg {
       "-v" => {
         verbose = true;
+        args.next();
+      }
+      "-j" => {
+        json_stdin = true;
         args.next();
       }
       "-d" | "-x" => {
@@ -47,20 +53,35 @@ fn main() {
   }
   let basedir = PathBuf::from(basedir.unwrap_or_else(|| format!(".")));
   if do_decompress {
-    let mut from_stdin = false;
     let mut args_vec = vec![];
     for arg in args {
       if arg == "-" {
         assert!(!from_stdin, "two stdin inputs");
         from_stdin = true;
-        for arg in std::io::stdin().lines() {
-          args_vec.push(arg.unwrap())
+        if json_stdin {
+          let str = std::io::read_to_string(std::io::stdin()).unwrap();
+          for j in serde_json::from_str::<Vec<serde_json::Value>>(&str).unwrap() {
+            args_vec.push(if let serde_json::Value::String(s) = j {
+              (None, s)
+            } else {
+              let j = j.as_object().expect("expected object");
+              let file = j["file"].as_str().expect("expected string");
+              let base = j.get("base").map(|b| b.as_str().expect("expected string").into());
+              (base, file.into())
+            })
+          }
+        } else {
+          for arg in std::io::stdin().lines().map(|arg| arg.unwrap()) {
+            args_vec.push((None, arg))
+          }
         }
       } else {
-        args_vec.push(arg)
+        args_vec.push((None, arg))
       }
     }
-    args_vec.into_par_iter().for_each(|tarfile| {
+
+    args_vec.into_par_iter().for_each(|(basedir2, tarfile)| {
+      let basedir = basedir2.as_ref().unwrap_or(&basedir);
       let mut tarfile = BufReader::new(File::open(tarfile).unwrap());
       let mut buf = vec![0; 4];
       tarfile.read_exact(&mut buf).unwrap();
