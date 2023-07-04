@@ -1,0 +1,148 @@
+name: Release
+on:
+  push:
+    tags:
+    - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  dist:
+    strategy:
+      fail-fast: false # don't fail other jobs if one fails
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: Linux aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: MacOS
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: MacOS aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            cross: true
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Test
+        if: matrix.target != 'aarch64-apple-darwin'
+        uses: actions-rs/cargo@v1
+        with:
+          use-cross: ${{ matrix.cross }}
+          command: test
+          args: --release --locked --target ${{ matrix.target }}
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          use-cross: ${{ matrix.cross }}
+          command: build
+          args: --release --locked --target ${{ matrix.target }}
+
+      - name: Strip release binary (linux and macos)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin'
+        run: strip "target/${{ matrix.target }}/release/leantar"
+
+      - name: Strip release binary (arm)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          docker run --rm -v \
+            "$PWD/target:/target:Z" \
+            rustembedded/cross:${{ matrix.target }} \
+            aarch64-linux-gnu-strip \
+            /target/${{ matrix.target }}/release/leantar
+
+      - name: Build archive
+        shell: bash
+        run: |
+          mkdir dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/leantar.exe" "dist/"
+          else
+            cp "target/${{ matrix.target }}/release/leantar" "dist/"
+          fi
+
+      - uses: actions/upload-artifact@v2.2.4
+        with:
+          name: bins-${{ matrix.target }}
+          path: dist
+
+  publish:
+    name: Publish
+    needs: [dist]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - uses: actions/download-artifact@v2
+      - run: ls -al bins-*
+
+      - name: Calculate tag name
+        run: |
+          name=dev
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            name=${GITHUB_REF:10}
+          fi
+          echo ::set-output name=val::$name
+          echo TAG=$name >> $GITHUB_ENV
+        id: tagname
+
+      - name: Build archive
+        shell: bash
+        run: |
+          set -ex
+
+          rm -rf tmp
+          mkdir tmp
+          mkdir dist
+
+          for dir in bins-* ; do
+            platform=${dir#"bins-"}
+            unset exe
+            if [[ $platform =~ "windows" ]]; then
+              exe=".exe"
+            fi
+            pkgname=leantar-$TAG-$platform
+            mkdir tmp/$pkgname
+            # cp LICENSE README.md tmp/$pkgname
+            mv bins-$platform/leantar$exe tmp/$pkgname
+            chmod +x tmp/$pkgname/leantar$exe
+
+            if [ "$exe" = "" ]; then
+              tar cJf dist/$pkgname.tar.xz -C tmp $pkgname
+            else
+              (cd tmp && 7z a -r ../dist/$pkgname.zip $pkgname)
+            fi
+          done
+
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/*
+          file_glob: true
+          tag: ${{ steps.tagname.outputs.val }}
+          overwrite: true
+
+      - name: Extract version
+        id: extract-version
+        run: |
+          printf "::set-output name=%s::%s\n" tag-name "${GITHUB_REF#refs/tags/}"

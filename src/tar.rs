@@ -1,8 +1,6 @@
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 use byteorder::LE;
-#[cfg(feature = "debug")]
-use leangz::STATS;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
@@ -12,8 +10,6 @@ use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
-#[cfg(feature = "debug")]
-use std::sync::atomic::Ordering;
 
 const COMPRESSION_LEVEL: i32 = 19;
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
@@ -55,7 +51,7 @@ fn main() {
       _ => break,
     }
   }
-  let basedir = PathBuf::from(basedir.unwrap_or_else(|| format!(".")));
+  let basedir = PathBuf::from(basedir.unwrap_or_else(|| ".".into()));
   if do_decompress {
     let mut args_vec = vec![];
     for arg in args {
