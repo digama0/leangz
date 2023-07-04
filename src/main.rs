@@ -161,13 +161,13 @@ struct Compressor<'a> {
 }
 
 #[cfg(feature = "zstd-dict")]
-const ZSTD_DICT: &[u8] = include_bytes!("lgz.dict");
+const ZSTD_DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
 impl Compressor<'_> {
   fn new() -> Self {
     Compressor {
       #[cfg(feature = "zstd-dict")]
-      dict: zstd::dict::EncoderDictionary::copy(ZSTD_DICT, COMPRESSION_LEVEL),
+      dict: zstd::dict::EncoderDictionary::copy(ZSTD_DICT_V1, COMPRESSION_LEVEL),
       _phantom: &(),
     }
   }
@@ -198,7 +198,7 @@ impl Decompressor<'_> {
   fn new() -> Self {
     Decompressor {
       #[cfg(feature = "zstd-dict")]
-      dict: zstd::dict::DecoderDictionary::copy(ZSTD_DICT),
+      dict: zstd::dict::DecoderDictionary::copy(ZSTD_DICT_V1),
       _phantom: &(),
     }
   }

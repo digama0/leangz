@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 const COMPRESSION_LEVEL: i32 = 19;
-const LGZ_DICT: &[u8] = include_bytes!("lgz.dict");
+const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
 fn main() {
   let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
@@ -67,22 +67,26 @@ fn main() {
           },
       }
       std::fs::write(trace_path, format!("{trace}")).unwrap();
-      let dict = zstd::dict::DecoderDictionary::copy(LGZ_DICT);
+      let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
       while let Some(path) = read_cstr(&mut buf, &mut tarfile) {
         if verbose {
           println!("copying {}", path.display());
         }
-        let is_lgz = tarfile.read_u8().unwrap() != 0;
+        let compression = tarfile.read_u8().unwrap();
         buf.clear();
         buf.resize(tarfile.read_u64::<LE>().unwrap() as usize, 0);
         tarfile.read_exact(&mut buf).unwrap();
         let reader = std::io::Cursor::new(&*buf);
-        if is_lgz {
-          let dec = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict).unwrap();
-          std::fs::write(path, &leangz::decompress(dec)).unwrap();
-        } else {
-          let mut dec = zstd::stream::Decoder::new(reader).unwrap();
-          std::io::copy(&mut dec, &mut File::create(path).unwrap()).unwrap();
+        match compression {
+          0 => {
+            let mut dec = zstd::stream::Decoder::new(reader).unwrap();
+            std::io::copy(&mut dec, &mut File::create(path).unwrap()).unwrap();
+          }
+          1 => {
+            let dec = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict).unwrap();
+            std::fs::write(path, &leangz::decompress(dec)).unwrap();
+          }
+          _ => panic!("unsupported compression {compression}"),
         }
       }
     })
@@ -96,7 +100,7 @@ fn main() {
     tarfile.write_u64::<LE>(trace).unwrap();
     tarfile.write_all(trace_path.as_bytes()).unwrap();
     tarfile.write_u8(0).unwrap();
-    let dict = zstd::dict::EncoderDictionary::copy(LGZ_DICT, COMPRESSION_LEVEL);
+    let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
     for file in args {
       tarfile.write_all(file.as_bytes()).unwrap();
       tarfile.write_u8(0).unwrap();
@@ -109,7 +113,7 @@ fn main() {
       let mut enc;
       if mmap.get(..16) == Some(b"oleanfile!!!!!!!") {
         tarfile.write_u8(1).unwrap();
-        enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict).unwrap();
+        enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1).unwrap();
         leangz::compress(&mmap, &mut enc);
       } else {
         tarfile.write_u8(0).unwrap();
