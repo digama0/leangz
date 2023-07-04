@@ -30,6 +30,10 @@ fn main() {
   let mut args = args.peekable();
   while let Some(arg) = args.peek() {
     match &**arg {
+      "--version" => {
+        println!("leantar {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+      }
       "-v" => {
         verbose = true;
         args.next();
@@ -111,6 +115,8 @@ fn main() {
         buf.resize(tarfile.read_u64::<LE>().unwrap() as usize, 0);
         tarfile.read_exact(&mut buf).unwrap();
         let reader = std::io::Cursor::new(&*buf);
+        let prefix = path.parent().unwrap();
+        std::fs::create_dir_all(prefix).unwrap();
         match compression {
           0 => {
             let mut dec = zstd::stream::Decoder::new(reader).unwrap();
