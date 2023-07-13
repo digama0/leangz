@@ -143,7 +143,7 @@ fn main() {
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
       oleans += mmap.len();
       let outfile = BufWriter::new(File::create(outfile).unwrap());
-      let mut w = leangz::WithPosition { r: outfile, pos: 0 };
+      let mut w = leangz::lgz::WithPosition { r: outfile, pos: 0 };
       compressor.compress(&mmap, &mut w);
       lgzs += w.pos;
     }
@@ -180,7 +180,7 @@ impl Compressor<'_> {
     #[cfg(feature = "zstd-dict")]
     let outfile = zstd::stream::Encoder::with_prepared_dictionary(outfile, &self.dict).unwrap();
     let mut outfile = outfile;
-    leangz::compress(olean, &mut outfile);
+    leangz::lgz::compress(olean, &mut outfile);
     #[cfg(any(feature = "flate2", feature = "zstd"))]
     outfile.finish().unwrap();
     #[cfg(not(any(feature = "flate2", feature = "zstd")))]
@@ -211,6 +211,6 @@ impl Decompressor<'_> {
     let infile =
       zstd::stream::Decoder::with_prepared_dictionary(std::io::BufReader::new(infile), &self.dict)
         .unwrap();
-    leangz::decompress(infile)
+    leangz::lgz::decompress(infile)
   }
 }
