@@ -5,6 +5,7 @@ use std::io::BufReader;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 fn main() {
   let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
@@ -50,6 +51,7 @@ fn main() {
   }
   let basedir = PathBuf::from(basedir.unwrap_or_else(|| ".".into()));
   if do_decompress {
+    let time0 = Instant::now();
     let mut args_vec = vec![];
     for arg in args {
       if arg == "-" {
@@ -80,9 +82,14 @@ fn main() {
       }
     }
 
+    let time1 = Instant::now();
+    if verbose {
+      eprintln!("parsed args in {} ms", (time1 - time0).as_millis())
+    }
     let mut error = AtomicBool::new(false);
     let fail = || error.store(true, std::sync::atomic::Ordering::Relaxed);
     args_vec.into_par_iter().for_each(|(basedir2, file)| {
+      let start = Instant::now();
       if verbose {
         println!("unpacking {file}");
       }
@@ -98,7 +105,14 @@ fn main() {
         eprintln!("{file}: {e}");
         fail()
       }
+      if verbose {
+        println!("unpacked {file} in {} ms", start.elapsed().as_millis());
+      }
     });
+    let time2 = Instant::now();
+    if verbose {
+      eprintln!("unpacked in {} ms", (time2 - time1).as_millis())
+    }
     std::process::exit(*error.get_mut() as i32);
   } else {
     let tarfile = args.next().unwrap_or_else(help);
