@@ -10,6 +10,7 @@ fn main() {
   let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
   let mut do_decompress = false;
   let mut verbose = false;
+  let mut debug = false;
   let mut from_stdin = false;
   let mut json_stdin = true;
   let mut basedir = None;
@@ -24,6 +25,10 @@ fn main() {
       }
       "-v" => {
         verbose = true;
+        args.next();
+      }
+      "-g" => {
+        debug = true;
         args.next();
       }
       "-j" => {
@@ -52,6 +57,9 @@ fn main() {
         from_stdin = true;
         if json_stdin {
           let str = std::io::read_to_string(std::io::stdin()).unwrap();
+          if debug {
+            println!("input json:\n{str}")
+          }
           for j in serde_json::from_str::<Vec<serde_json::Value>>(&str).unwrap() {
             args_vec.push(if let serde_json::Value::String(s) = j {
               (None, s)
