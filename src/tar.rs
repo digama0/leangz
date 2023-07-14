@@ -1,5 +1,6 @@
 use leangz::ltar;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::BufWriter;
@@ -35,6 +36,11 @@ fn main() {
       "-j" => {
         json_stdin = true;
         args.next();
+      }
+      "--jobs" => {
+        args.next();
+        let jobs = args.next().unwrap_or_else(help).parse::<usize>().unwrap();
+        ThreadPoolBuilder::new().num_threads(jobs).build_global().unwrap();
       }
       "-d" | "-x" => {
         do_decompress = true;
