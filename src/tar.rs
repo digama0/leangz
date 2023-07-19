@@ -11,6 +11,7 @@ fn main() {
   let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
   let mut do_decompress = false;
   let mut verbose = false;
+  let mut force = false;
   let mut from_stdin = false;
   let mut json_stdin = true;
   let mut basedir = None;
@@ -25,6 +26,10 @@ fn main() {
       }
       "-v" => {
         verbose = true;
+        args.next();
+      }
+      "-f" => {
+        force = true;
         args.next();
       }
       "-j" => {
@@ -92,7 +97,7 @@ fn main() {
         }
         e => BufReader::new(e.unwrap()),
       };
-      if let Err(e) = ltar::unpack(basedir, tarfile, false, verbose) {
+      if let Err(e) = ltar::unpack(basedir, tarfile, force, verbose) {
         eprintln!("{file}: {e}");
         fail()
       }
