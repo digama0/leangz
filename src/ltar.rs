@@ -6,68 +6,92 @@ use std::fs::File;
 use std::io;
 use std::io::BufRead;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::lgz;
 
 const COMPRESSION_LEVEL: i32 = 19;
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
+pub enum UnpackError {
+  IOError(io::Error),
+  InvalidUtf8(std::str::Utf8Error),
+  BadLtar,
+  BadTrace,
+  UnsupportedCompression(u8),
+}
+
+impl std::fmt::Display for UnpackError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      UnpackError::IOError(e) => e.fmt(f),
+      UnpackError::InvalidUtf8(e) => e.fmt(f),
+      UnpackError::BadLtar => write!(f, "bad .ltar file"),
+      UnpackError::BadTrace => write!(f, "bad .trace file"),
+      UnpackError::UnsupportedCompression(c) => write!(f, "unsupported compression {c}"),
+    }
+  }
+}
+
+impl From<io::Error> for UnpackError {
+  fn from(v: io::Error) -> Self { Self::IOError(v) }
+}
+impl From<std::str::Utf8Error> for UnpackError {
+  fn from(v: std::str::Utf8Error) -> Self { Self::InvalidUtf8(v) }
+}
+
 pub fn unpack<R: BufRead>(
   basedir: &Path, mut tarfile: R, force: bool, verbose: bool,
-) -> io::Result<()> {
+) -> Result<(), UnpackError> {
   let mut buf = vec![0; 4];
-  let is_ltar = match tarfile.read_exact(&mut buf) {
-    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
-    e => {
-      e.unwrap();
-      buf == *b"LTAR"
-    }
-  };
-  if !is_ltar {
-    return Err(io::Error::new(io::ErrorKind::InvalidData, "not a valid .ltar file"))
+  tarfile.read_exact(&mut buf)?;
+  if buf != *b"LTAR" {
+    return Err(UnpackError::BadLtar)
   }
-  let trace = tarfile.read_u64::<LE>().unwrap();
-  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| {
+  let trace = tarfile.read_u64::<LE>()?;
+  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<PathBuf>, UnpackError> {
     buf.clear();
-    tarfile.read_until(0, buf).unwrap();
-    buf.pop().map(|_| basedir.join(std::str::from_utf8(buf).unwrap()))
+    tarfile.read_until(0, buf)?;
+    Ok(match buf.pop() {
+      Some(_) => Some(basedir.join(std::str::from_utf8(buf)?)),
+      None => None,
+    })
   };
-  let trace_path = read_cstr(&mut buf, &mut tarfile).unwrap();
+  let trace_path = read_cstr(&mut buf, &mut tarfile)?.ok_or(UnpackError::BadLtar)?;
   if !force {
     match std::fs::read_to_string(&trace_path) {
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
       res =>
-        if trace == res.unwrap().parse::<u64>().expect("expected .trace file") {
+        if trace == res?.parse::<u64>().map_err(|_| UnpackError::BadTrace)? {
           return Ok(())
         },
     }
   }
-  let prefix = trace_path.parent().unwrap();
-  std::fs::create_dir_all(prefix).unwrap();
-  std::fs::write(trace_path, format!("{trace}")).unwrap();
+  let prefix = trace_path.parent().ok_or(UnpackError::BadLtar)?;
+  std::fs::create_dir_all(prefix)?;
+  std::fs::write(trace_path, format!("{trace}"))?;
   let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
-  while let Some(path) = read_cstr(&mut buf, &mut tarfile) {
+  while let Some(path) = read_cstr(&mut buf, &mut tarfile)? {
     if verbose {
       println!("copying {}", path.display());
     }
-    let compression = tarfile.read_u8().unwrap();
+    let compression = tarfile.read_u8()?;
     buf.clear();
-    buf.resize(tarfile.read_u64::<LE>().unwrap() as usize, 0);
-    tarfile.read_exact(&mut buf).unwrap();
+    buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+    tarfile.read_exact(&mut buf)?;
     let reader = std::io::Cursor::new(&*buf);
-    let prefix = path.parent().unwrap();
-    std::fs::create_dir_all(prefix).unwrap();
+    let prefix = path.parent().ok_or(UnpackError::BadLtar)?;
+    std::fs::create_dir_all(prefix)?;
     match compression {
       0 => {
-        let mut dec = zstd::stream::Decoder::new(reader).unwrap();
-        std::io::copy(&mut dec, &mut File::create(path).unwrap()).unwrap();
+        let mut dec = zstd::stream::Decoder::new(reader)?;
+        std::io::copy(&mut dec, &mut File::create(path)?)?;
       }
       1 => {
-        let dec = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict).unwrap();
-        std::fs::write(path, &lgz::decompress(dec)).unwrap();
+        let dec = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
+        std::fs::write(path, &lgz::decompress(dec))?;
       }
-      _ => panic!("unsupported compression {compression}"),
+      _ => return Err(UnpackError::UnsupportedCompression(compression)),
     }
   }
   Ok(())
