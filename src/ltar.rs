@@ -42,7 +42,7 @@ impl From<std::str::Utf8Error> for UnpackError {
 
 pub fn unpack<R: BufRead>(
   basedir: &Path, mut tarfile: R, force: bool, verbose: bool,
-) -> Result<(), UnpackError> {
+) -> Result<u64, UnpackError> {
   let mut buf = vec![0; 4];
   tarfile.read_exact(&mut buf)?;
   if buf != *b"LTAR" {
@@ -63,7 +63,7 @@ pub fn unpack<R: BufRead>(
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
       res =>
         if trace == res?.parse::<u64>().map_err(|_| UnpackError::BadTrace)? {
-          return Ok(())
+          return Ok(trace)
         },
     }
   }
@@ -94,7 +94,7 @@ pub fn unpack<R: BufRead>(
       _ => return Err(UnpackError::UnsupportedCompression(compression)),
     }
   }
-  Ok(())
+  Ok(trace)
 }
 
 pub fn pack(
