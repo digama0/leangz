@@ -49,15 +49,20 @@ pub fn unpack<R: BufRead>(
     return Err(UnpackError::BadLtar)
   }
   let trace = tarfile.read_u64::<LE>()?;
-  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<PathBuf>, UnpackError> {
+  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
     buf.clear();
     tarfile.read_until(0, buf)?;
-    Ok(match buf.pop() {
-      Some(_) => Some(basedir.join(std::str::from_utf8(buf)?)),
-      None => None,
-    })
+    Ok(buf.pop().is_some())
   };
-  let trace_path = read_cstr(&mut buf, &mut tarfile)?.ok_or(UnpackError::BadLtar)?;
+  let read_cstr_path =
+    |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<Option<PathBuf>>, UnpackError> {
+      Ok(match read_cstr(buf, tarfile)? {
+        true if buf.is_empty() => Some(None),
+        true => Some(Some(basedir.join(std::str::from_utf8(buf)?))),
+        false => None,
+      })
+    };
+  let trace_path = read_cstr_path(&mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
   if !force {
     match std::fs::read_to_string(&trace_path) {
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -71,7 +76,16 @@ pub fn unpack<R: BufRead>(
   std::fs::create_dir_all(prefix)?;
   std::fs::write(trace_path, format!("{trace}"))?;
   let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
-  while let Some(path) = read_cstr(&mut buf, &mut tarfile)? {
+  while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
+    let Some(path) = path else {
+      if !read_cstr(&mut buf, &mut tarfile)? {
+        return Err(UnpackError::BadLtar)
+      }
+      if verbose {
+        println!("comment: {}", std::str::from_utf8(&buf)?);
+      }
+      continue
+    };
     if verbose {
       println!("copying {}", path.display());
     }
@@ -108,7 +122,15 @@ pub fn pack(
   tarfile.write_all(trace_path.as_bytes())?;
   tarfile.write_u8(0)?;
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
-  for file in args {
+  let mut it = args.into_iter();
+  while let Some(file) = it.next() {
+    if file == "-c" {
+      let comment = it.next().expect("expected comment argument");
+      tarfile.write_u8(0)?;
+      tarfile.write_all(comment.as_bytes())?;
+      tarfile.write_u8(0)?;
+      continue
+    }
     tarfile.write_all(file.as_bytes())?;
     tarfile.write_u8(0)?;
     let path = basedir.join(file);
