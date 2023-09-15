@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 fn main() {
   let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
   let mut do_decompress = false;
+  let mut do_show_comments = false;
   let mut verbose = false;
   let mut force = false;
   let mut from_stdin = false;
@@ -51,11 +52,34 @@ fn main() {
           help();
         }
       }
+      "-k" => {
+        do_show_comments = true;
+        args.next();
+      }
       _ => break,
     }
   }
   let basedir = PathBuf::from(basedir.unwrap_or_else(|| ".".into()));
-  if do_decompress {
+  if do_show_comments {
+    let file = args.next().unwrap_or_else(help);
+    let tarfile = match File::open(&file) {
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        eprintln!("{file} not found");
+        std::process::exit(1);
+      }
+      e => BufReader::new(e.unwrap()),
+    };
+    match ltar::comments(tarfile) {
+      Err(e) => {
+        eprintln!("{e}");
+        std::process::exit(1);
+      }
+      Ok(comments) =>
+        for comment in comments {
+          println!("{comment}")
+        },
+    }
+  } else if do_decompress {
     let mut args_vec = vec![];
     for arg in args {
       if arg == "-" {

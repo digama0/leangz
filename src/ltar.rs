@@ -3,9 +3,7 @@ use byteorder::WriteBytesExt;
 use byteorder::LE;
 use memmap2::Mmap;
 use std::fs::File;
-use std::io;
-use std::io::BufRead;
-use std::io::Write;
+use std::io::{self, BufRead, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::lgz;
@@ -154,4 +152,35 @@ pub fn pack(
     tarfile.write_all(&buf)?;
   }
   Ok(())
+}
+
+pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, UnpackError> {
+  let mut buf = vec![0; 4];
+  tarfile.read_exact(&mut buf)?;
+  if buf != *b"LTAR" {
+    return Err(UnpackError::BadLtar)
+  }
+  tarfile.read_u64::<LE>()?;
+  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
+    buf.clear();
+    tarfile.read_until(0, buf)?;
+    Ok(buf.pop().is_some())
+  };
+  if !read_cstr(&mut buf, &mut tarfile)? {
+    return Err(UnpackError::BadLtar)
+  }
+  let mut comments = vec![];
+  while read_cstr(&mut buf, &mut tarfile)? {
+    if buf.is_empty() {
+      if !read_cstr(&mut buf, &mut tarfile)? {
+        return Err(UnpackError::BadLtar)
+      }
+      comments.push(std::str::from_utf8(&buf)?.to_string());
+      continue
+    }
+    tarfile.read_u8()?;
+    let len = tarfile.read_u64::<LE>()?;
+    tarfile.seek(io::SeekFrom::Current(len as _))?;
+  }
+  Ok(comments)
 }
