@@ -1,6 +1,4 @@
-use byteorder::ReadBytesExt;
-use byteorder::WriteBytesExt;
-use byteorder::LE;
+use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, BufRead, Seek, Write};
@@ -10,6 +8,10 @@ use crate::lgz;
 
 const COMPRESSION_LEVEL: i32 = 19;
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
+
+const COMPRESSION_ZSTD: u8 = 0;
+const COMPRESSION_LGZ: u8 = 1;
+const COMPRESSION_HASH: u8 = 2;
 
 pub enum UnpackError {
   IOError(io::Error),
@@ -87,23 +89,27 @@ pub fn unpack<R: BufRead>(
     if verbose {
       println!("copying {}", path.display());
     }
-    let compression = tarfile.read_u8()?;
-    buf.clear();
-    buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-    tarfile.read_exact(&mut buf)?;
-    let reader = std::io::Cursor::new(&*buf);
     let prefix = path.parent().ok_or(UnpackError::BadLtar)?;
     std::fs::create_dir_all(prefix)?;
-    match compression {
-      0 => {
+    match tarfile.read_u8()? {
+      COMPRESSION_ZSTD => {
+        buf.clear();
+        buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+        tarfile.read_exact(&mut buf)?;
+        let reader = std::io::Cursor::new(&*buf);
         let mut dec = zstd::stream::Decoder::new(reader)?;
         std::io::copy(&mut dec, &mut File::create(path)?)?;
       }
-      1 => {
+      COMPRESSION_LGZ => {
+        buf.clear();
+        buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+        tarfile.read_exact(&mut buf)?;
+        let reader = std::io::Cursor::new(&*buf);
         let dec = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
         std::fs::write(path, &lgz::decompress(dec))?;
       }
-      _ => return Err(UnpackError::UnsupportedCompression(compression)),
+      COMPRESSION_HASH => std::fs::write(path, format!("{}", tarfile.read_u64::<LE>()?))?,
+      compression => return Err(UnpackError::UnsupportedCompression(compression)),
     }
   }
   Ok(trace)
@@ -137,19 +143,29 @@ pub fn pack(
     }
     let mmap = unsafe { Mmap::map(&File::open(path)?)? };
     let mut buf = vec![];
-    let mut enc;
     if mmap.get(..16) == Some(b"oleanfile!!!!!!!") {
-      tarfile.write_u8(1)?;
-      enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
+      tarfile.write_u8(COMPRESSION_LGZ)?;
+      let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
       lgz::compress(&mmap, &mut enc);
+      enc.finish()?;
+      tarfile.write_u64::<LE>(buf.len() as u64)?;
+      tarfile.write_all(&buf)?;
+    } else if let Some(n) = (|| {
+      if mmap.len() > 20 {
+        return None
+      }
+      std::str::from_utf8(&mmap).ok()?.parse::<u64>().ok()
+    })() {
+      tarfile.write_u8(COMPRESSION_HASH)?;
+      tarfile.write_u64::<LE>(n)?;
     } else {
-      tarfile.write_u8(0)?;
-      enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
+      tarfile.write_u8(COMPRESSION_ZSTD)?;
+      let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
       enc.write_all(&mmap)?;
+      enc.finish()?;
+      tarfile.write_u64::<LE>(buf.len() as u64)?;
+      tarfile.write_all(&buf)?;
     }
-    enc.finish()?;
-    tarfile.write_u64::<LE>(buf.len() as u64)?;
-    tarfile.write_all(&buf)?;
   }
   Ok(())
 }
