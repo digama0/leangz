@@ -32,11 +32,74 @@ const USE_GMP: bool = if cfg!(feature = "gmp") {
   cfg!(target_family = "unix") && cfg!(target_arch = "x86_64")
 };
 
-pub fn compress(olean: &[u8], mut outfile: impl Write) {
-  let (header, rest) = LayoutVerified::<_, Header>::new_from_prefix(olean).expect("bad header");
+enum OLeanVersion {
+  V0,
+  V1,
+}
+
+#[repr(C, align(8))]
+#[derive(FromBytes, AsBytes)]
+struct HeaderV0 {
+  magic: [u8; 16],
+  base: U64<LE>,
+  root: U64<LE>,
+}
+
+struct Header {
+  githash: [u8; 16],
+  base: u64,
+  root: u64,
+}
+
+fn parse_as_v0(olean: &[u8]) -> (Header, u64, &[u8]) {
+  let (header, rest) = LayoutVerified::<_, HeaderV0>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
-  let offset = base + size_of::<Header>() as u64;
+  let offset = base + size_of::<HeaderV0>() as u64;
+  (Header { base, githash: [0; 16], root: header.root.get() }, offset, rest)
+}
+
+#[repr(C, align(8))]
+#[derive(FromBytes, AsBytes)]
+struct HeaderV1 {
+  magic: [u8; 16],
+  githash: [u8; 32],
+  base: U64<LE>,
+  root: U64<LE>,
+}
+
+fn sniff_olean_v1(olean: &[u8]) -> bool {
+  LayoutVerified::<_, HeaderV1>::new_from_prefix(olean).map_or(false, |(header, _)| {
+    header.githash.iter().all(|&c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+  })
+}
+
+fn parse_as_v1(olean: &[u8]) -> (Header, u64, &[u8]) {
+  let (header, rest) = LayoutVerified::<_, HeaderV1>::new_from_prefix(olean).expect("bad header");
+  assert_eq!(&header.magic, b"oleanfile!!!!!!!");
+  let base = header.base.get();
+  let offset = base + size_of::<HeaderV1>() as u64;
+  let mut githash = [0; 16];
+  #[allow(clippy::needless_range_loop)]
+  for i in 0..16 {
+    fn decode_hex(c: u8) -> u8 {
+      match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => (c - b'a') + 10,
+        _ => unreachable!(),
+      }
+    }
+    githash[i] = (decode_hex(header.githash[2 * i]) << 4) | decode_hex(header.githash[2 * i + 1])
+  }
+  (Header { base, githash, root: header.root.get() }, offset, rest)
+}
+
+pub fn compress(olean: &[u8], outfile: impl Write) {
+  let (version, (Header { githash, base, root }, offset, rest)) = if sniff_olean_v1(olean) {
+    (OLeanVersion::V1, parse_as_v1(olean))
+  } else {
+    (OLeanVersion::V0, parse_as_v0(olean))
+  };
   assert!(base & !((u32::MAX as u64) << 16) == 0);
   let mut refs = vec![0u8; rest.len() >> 3];
   let mut pos = 0;
@@ -47,26 +110,28 @@ pub fn compress(olean: &[u8], mut outfile: impl Write) {
     });
     pos = pad_to(pos, 8).1;
   }
-  outfile.write_all(MAGIC).unwrap();
   let mut w = LgzWriter {
-    file: WithPosition { r: outfile, pos: 4 },
+    file: WithPosition { r: outfile, pos: 0 },
     refs: &refs,
     offset,
     backrefs: Default::default(),
     buf: rest,
     depth: 0,
   };
-  w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
-  w.file.write_u64::<LE>(olean.len() as u64).unwrap();
-  w.write_obj(header.root.get(), LgzMode::Normal);
-}
-
-#[repr(C, align(8))]
-#[derive(FromBytes, AsBytes)]
-struct Header {
-  magic: [u8; 16],
-  base: U64<LE>,
-  root: U64<LE>,
+  match version {
+    OLeanVersion::V0 => {
+      w.file.write_all(&MAGIC0).unwrap();
+      w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
+      w.file.write_u64::<LE>(olean.len() as u64).unwrap();
+    }
+    OLeanVersion::V1 => {
+      w.file.write_all(&MAGIC1).unwrap();
+      w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
+      w.file.write_u64::<LE>(olean.len() as u64).unwrap();
+      w.file.write_all(&githash).unwrap();
+    }
+  }
+  w.write_obj(root, LgzMode::Normal);
 }
 
 #[repr(C, align(8))]
@@ -228,7 +293,8 @@ struct LgzWriter<'a, W> {
 
 pub const NAME_ANON_HASH: u64 = 1723;
 
-pub(crate) const MAGIC: &[u8; 4] = b"LGZ!";
+pub(crate) const MAGIC0: [u8; 4] = *b"LGZ!";
+pub(crate) const MAGIC1: [u8; 4] = *b"LGZ1";
 
 // These are valid in normal and exprish mode
 pub(crate) const UINT0: u8 = 0xd0;
@@ -1117,15 +1183,22 @@ impl<W: Write> LgzWriter<'_, W> {
   }
 }
 
+enum LgzVersion {
+  V0,
+  V1,
+}
+
 pub fn decompress(mut infile: impl Read) -> Vec<u8> {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
-  assert_eq!(&magic, MAGIC);
+  let version = match magic {
+    MAGIC1 => LgzVersion::V1,
+    MAGIC0 => LgzVersion::V0,
+    _ => panic!("unrecognized LGZ version"),
+  };
   let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
   let mut out = Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize);
   out.write_all(b"oleanfile!!!!!!!").unwrap();
-  out.write_u64::<LE>(base).unwrap();
-  out.write_u64::<LE>(0).unwrap(); // fixed below
   let mut w = LgzDecompressor {
     file: WithPosition { r: infile, pos: 8 },
     buf: out,
@@ -1135,8 +1208,29 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
     stack: vec![],
     temp: vec![],
   };
+  match version {
+    LgzVersion::V0 => {}
+    LgzVersion::V1 => {
+      let mut githash_in = [0; 16];
+      w.file.read_exact(&mut githash_in).unwrap();
+      for &c in &githash_in {
+        fn encode_hex(c: u8) -> u8 {
+          match c {
+            0..=9 => c + b'0',
+            10..=15 => (c - 10) + b'a',
+            _ => unreachable!(),
+          }
+        }
+        w.buf.push(encode_hex(c >> 4));
+        w.buf.push(encode_hex(c & 0xf));
+      }
+    }
+  }
+  w.buf.write_u64::<LE>(base).unwrap();
+  let fixup_pos = w.buf.len();
+  w.buf.write_u64::<LE>(0).unwrap(); // fixed below
   let root = w.write_obj();
-  LE::write_u64(&mut w.buf[24..], root);
+  LE::write_u64(&mut w.buf[fixup_pos..], root);
   w.buf
 }
 
