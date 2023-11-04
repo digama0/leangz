@@ -46,7 +46,7 @@ struct HeaderV0 {
 }
 
 struct Header {
-  githash: [u8; 16],
+  githash: [u8; 40],
   base: u64,
   root: u64,
 }
@@ -56,49 +56,38 @@ fn parse_as_v0(olean: &[u8]) -> (Header, u64, &[u8]) {
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
-  (Header { base, githash: [0; 16], root: header.root.get() }, offset, rest)
+  (Header { base, githash: [0; 40], root: header.root.get() }, offset, rest)
 }
 
 #[repr(C, align(8))]
 #[derive(FromBytes, AsBytes)]
 struct HeaderV1 {
-  magic: [u8; 16],
-  githash: [u8; 32],
+  magic: [u8; 9],
+  githash: [u8; 39],
   base: U64<LE>,
   root: U64<LE>,
 }
 
-fn sniff_olean_v1(olean: &[u8]) -> bool {
-  LayoutVerified::<_, HeaderV1>::new_from_prefix(olean).map_or(false, |(header, _)| {
-    header.githash.iter().all(|&c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
-  })
+fn sniff_olean_v0(olean: &[u8]) -> bool {
+  LayoutVerified::<_, HeaderV0>::new_from_prefix(olean)
+    .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
 }
 
 fn parse_as_v1(olean: &[u8]) -> (Header, u64, &[u8]) {
   let (header, rest) = LayoutVerified::<_, HeaderV1>::new_from_prefix(olean).expect("bad header");
-  assert_eq!(&header.magic, b"oleanfile!!!!!!!");
+  assert_eq!(&header.magic, b"oleanfile");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV1>() as u64;
-  let mut githash = [0; 16];
-  #[allow(clippy::needless_range_loop)]
-  for i in 0..16 {
-    fn decode_hex(c: u8) -> u8 {
-      match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => (c - b'a') + 10,
-        _ => unreachable!(),
-      }
-    }
-    githash[i] = (decode_hex(header.githash[2 * i]) << 4) | decode_hex(header.githash[2 * i + 1])
-  }
+  let mut githash = [0; 40];
+  githash.copy_from_slice(&header.githash);
   (Header { base, githash, root: header.root.get() }, offset, rest)
 }
 
 pub fn compress(olean: &[u8], outfile: impl Write) {
-  let (version, (Header { githash, base, root }, offset, rest)) = if sniff_olean_v1(olean) {
-    (OLeanVersion::V1, parse_as_v1(olean))
-  } else {
+  let (version, (Header { githash, base, root }, offset, rest)) = if sniff_olean_v0(olean) {
     (OLeanVersion::V0, parse_as_v0(olean))
+  } else {
+    (OLeanVersion::V1, parse_as_v1(olean))
   };
   assert!(base & !((u32::MAX as u64) << 16) == 0);
   let mut refs = vec![0u8; rest.len() >> 3];
@@ -1197,11 +1186,9 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
     _ => panic!("unrecognized LGZ version"),
   };
   let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
-  let mut out = Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize);
-  out.write_all(b"oleanfile!!!!!!!").unwrap();
   let mut w = LgzDecompressor {
+    buf: Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize),
     file: WithPosition { r: infile, pos: 8 },
-    buf: out,
     offset: base,
     // depth: 0,
     backrefs: Default::default(),
@@ -1209,21 +1196,12 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
     temp: vec![],
   };
   match version {
-    LgzVersion::V0 => {}
+    LgzVersion::V0 => w.buf.write_all(b"oleanfile!!!!!!!").unwrap(),
     LgzVersion::V1 => {
-      let mut githash_in = [0; 16];
+      w.buf.write_all(b"oleanfile").unwrap();
+      let mut githash_in = [0; 40];
       w.file.read_exact(&mut githash_in).unwrap();
-      for &c in &githash_in {
-        fn encode_hex(c: u8) -> u8 {
-          match c {
-            0..=9 => c + b'0',
-            10..=15 => (c - 10) + b'a',
-            _ => unreachable!(),
-          }
-        }
-        w.buf.push(encode_hex(c >> 4));
-        w.buf.push(encode_hex(c & 0xf));
-      }
+      w.buf.extend_from_slice(&githash_in[..39]);
     }
   }
   w.buf.write_u64::<LE>(base).unwrap();
