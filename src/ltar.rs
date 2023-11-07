@@ -143,7 +143,7 @@ pub fn pack(
     }
     let mmap = unsafe { Mmap::map(&File::open(path)?)? };
     let mut buf = vec![];
-    if mmap.get(..16) == Some(b"oleanfile!!!!!!!") {
+    if mmap.get(..5) == Some(b"olean") {
       tarfile.write_u8(COMPRESSION_LGZ)?;
       let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
       lgz::compress(&mmap, &mut enc);
