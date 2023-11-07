@@ -151,7 +151,7 @@ pub fn pack(
     }
     let mmap = unsafe { Mmap::map(&File::open(path)?)? };
     let mut buf = vec![];
-    if mmap.get(..16) == Some(b"oleanfile!!!!!!!") {
+    if mmap.get(..5) == Some(b"olean") {
       tarfile.write_u8(COMPRESSION_LGZ)?;
       #[cfg(feature = "zstd")]
       {
