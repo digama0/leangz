@@ -10,6 +10,8 @@ default-run = "leangz"
 debug = []
 zstd-train = ["zstd", "zstd/zdict_builder"]
 zstd-dict = ["zstd"]
+gmp = []
+no-gmp = []
 default = ["zstd", "zstd-dict"]
 
 [dependencies]

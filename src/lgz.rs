@@ -24,6 +24,14 @@ pub static STATS: Stats = {
   Stats { normal: [NEW; 256], exprish: [NEW; 256] }
 };
 
+const USE_GMP: bool = if cfg!(feature = "gmp") {
+  true
+} else if cfg!(feature = "no-gmp") {
+  false
+} else {
+  cfg!(target_family = "unix") && cfg!(target_arch = "x86_64")
+};
+
 pub fn compress(olean: &[u8], mut outfile: impl Write) {
   let (header, rest) = LayoutVerified::<_, Header>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
@@ -154,17 +162,24 @@ fn on_subobjs(buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
       let (_length, pos) = parse_u64(buf, pos);
       pos + capacity as usize
     }
-    tag::MPZ => {
-      let (capacity, pos) = parse_u32(buf, pos);
-      let (size, pos) = parse_i32(buf, pos);
-      debug_assert!(
-        header.cs_sz.get() == ((capacity + 3) as u16) << 3
-          && size.unsigned_abs() == capacity
-          && capacity != 0
-      );
-      let (_limbs_ptr, pos) = parse_u64(buf, pos);
-      pos + (8 * capacity) as usize
-    }
+    tag::MPZ =>
+      if USE_GMP {
+        let (capacity, pos) = parse_u32(buf, pos);
+        let (size, pos) = parse_i32(buf, pos);
+        debug_assert!(
+          header.cs_sz.get() == ((capacity + 3) as u16) << 3
+            && size.unsigned_abs() == capacity
+            && capacity != 0
+        );
+        let (_limbs_ptr, pos) = parse_u64(buf, pos);
+        pos + (8 * capacity) as usize
+      } else {
+        let (sign, pos) = parse_u64(buf, pos);
+        let (size, pos) = parse_u64(buf, pos);
+        debug_assert!(header.cs_sz.get() == ((size + 8) as u16) << 2 && sign < 2 && size != 0);
+        let (_limbs_ptr, pos) = parse_u64(buf, pos);
+        pos + (4 * size) as usize
+      },
     tag::THUNK | tag::TASK => {
       let (value, pos) = parse_u64(buf, pos);
       let (imp, pos) = parse_u64(buf, pos);
@@ -440,11 +455,19 @@ fn get_num_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   } else {
     let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
     if header.tag == tag::MPZ {
-      let (_capacity, pos) = parse_u32(buf, pos);
-      let (sign_size, pos) = parse_i32(buf, pos);
-      let (_limbs_ptr, pos) = parse_u64(buf, pos);
-      let (lo, _) = parse_u64(buf, pos);
-      return Some(if sign_size < 0 { lo.wrapping_neg() } else { lo })
+      if USE_GMP {
+        let (_capacity, pos) = parse_u32(buf, pos);
+        let (sign_size, pos) = parse_i32(buf, pos);
+        let (_limbs_ptr, pos) = parse_u64(buf, pos);
+        let (lo, _) = parse_u64(buf, pos);
+        return Some(if sign_size < 0 { lo.wrapping_neg() } else { lo })
+      } else {
+        let (sign, pos) = parse_u64(buf, pos);
+        let (_size, pos) = parse_u64(buf, pos);
+        let (_limbs_ptr, pos) = parse_u64(buf, pos);
+        let (lo, _) = parse_u64(buf, pos);
+        return Some(if sign != 0 { lo.wrapping_neg() } else { lo })
+      }
     }
     None
   }
@@ -1033,12 +1056,24 @@ impl<W: Write> LgzWriter<'_, W> {
         self.file.write_all(s2).unwrap();
       }
       tag::MPZ => {
+        let (capacity, sign_size, pos) = if USE_GMP {
+          let (capacity, pos) = parse_u32(self.buf, pos);
+          let (sign_size, pos) = parse_u32(self.buf, pos);
+          let (_limbs_ptr, pos) = parse_u64(self.buf, pos);
+          (capacity as usize, sign_size, pos)
+        } else {
+          let (sign, pos) = parse_u64(self.buf, pos);
+          let (size, pos) = parse_u64(self.buf, pos);
+          let (_limbs_ptr, pos) = parse_u64(self.buf, pos);
+          let capacity = (size + 1) >> 1;
+          assert!(capacity <= i32::MAX as u64);
+          let sign_size = if sign != 0 { -(capacity as i32) as u32 } else { capacity as u32 };
+          assert!(size & 1 == 0 || self.buf[pos + 8 * capacity as usize - 4..][..4] == [0; 4]);
+          (capacity as usize, sign_size, pos)
+        };
         self.write_op(mode, LgzMode::Normal, MPZ);
-        let (capacity, pos) = parse_u32(self.buf, pos);
-        let (sign_size, pos) = parse_u32(self.buf, pos);
         self.write_i64(LgzMode::Normal, sign_size.into());
-        let (_limbs_ptr, pos) = parse_u64(self.buf, pos);
-        self.file.write_all(&self.buf[pos..][..8 * capacity as usize]).unwrap();
+        self.file.write_all(&self.buf[pos..][..8 * capacity]).unwrap();
       }
       tag::THUNK | tag::TASK | tag::REF => {
         self.write_op(mode, LgzMode::Normal, header.tag);
@@ -1592,12 +1627,27 @@ impl<R: Read> LgzDecompressor<R> {
         let tag = self.file.read_u8().unwrap();
         let sign_size = self.read_i64(tag) as i32;
         let capacity = sign_size as u32 & 0x7FFFFFFF;
-        let pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
-        self.write_u32(capacity);
-        self.write_u32(sign_size as u32);
-        self.write_u64(self.pos() + 8);
         let size = (capacity as usize) << 3;
-        self.copy(size, size);
+        let pos;
+        if USE_GMP {
+          pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
+          self.write_u32(capacity);
+          self.write_u32(sign_size as u32);
+          self.write_u64(self.pos() + 8);
+          self.copy(size, size);
+        } else {
+          self.temp.resize(size, 0);
+          self.file.read_exact(&mut self.temp).unwrap();
+          let mut size2 = size >> 2;
+          if self.temp[size - 4..] == [0; 4] {
+            size2 -= 1
+          }
+          pos = self.write_header(tag::MPZ, ((size2 + 8) as u16) << 2, 0);
+          self.write_u64((sign_size < 0) as u64);
+          self.write_u64(size2 as u64);
+          self.write_u64(self.pos() + 8);
+          self.buf.write_all(&self.temp).unwrap();
+        }
         pos
       }
       tag @ (THUNK | TASK) => {
