@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::lgz;
 
+#[cfg(feature = "zstd")]
 const COMPRESSION_LEVEL: i32 = 19;
+#[cfg(all(feature = "zstd", feature = "zstd-dict"))]
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
 const COMPRESSION_ZSTD: u8 = 0;
@@ -75,6 +77,7 @@ pub fn unpack<R: BufRead>(
   let prefix = trace_path.parent().ok_or(UnpackError::BadLtar)?;
   std::fs::create_dir_all(prefix)?;
   std::fs::write(trace_path, format!("{trace}"))?;
+  #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
   while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
     let Some(path) = path else {
@@ -97,16 +100,20 @@ pub fn unpack<R: BufRead>(
         buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
         tarfile.read_exact(&mut buf)?;
         let reader = std::io::Cursor::new(&*buf);
-        let mut dec = zstd::stream::Decoder::new(reader)?;
-        std::io::copy(&mut dec, &mut File::create(path)?)?;
+        #[cfg(feature = "zstd")]
+        let reader = zstd::stream::Decoder::new(reader)?;
+        std::io::copy(&mut { reader }, &mut File::create(path)?)?;
       }
       COMPRESSION_LGZ => {
         buf.clear();
         buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
         tarfile.read_exact(&mut buf)?;
         let reader = std::io::Cursor::new(&*buf);
-        let dec = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
-        std::fs::write(path, &lgz::decompress(dec))?;
+        #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+        let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
+        #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
+        let reader = zstd::stream::Decoder::new(reader)?;
+        std::fs::write(path, &lgz::decompress(reader))?;
       }
       COMPRESSION_HASH => std::fs::write(path, format!("{}", tarfile.read_u64::<LE>()?))?,
       compression => return Err(UnpackError::UnsupportedCompression(compression)),
@@ -125,6 +132,7 @@ pub fn pack(
   tarfile.write_u64::<LE>(trace)?;
   tarfile.write_all(trace_path.as_bytes())?;
   tarfile.write_u8(0)?;
+  #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
   let mut it = args.into_iter();
   while let Some(file) = it.next() {
@@ -145,9 +153,17 @@ pub fn pack(
     let mut buf = vec![];
     if mmap.get(..16) == Some(b"oleanfile!!!!!!!") {
       tarfile.write_u8(COMPRESSION_LGZ)?;
-      let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
-      lgz::compress(&mmap, &mut enc);
-      enc.finish()?;
+      #[cfg(feature = "zstd")]
+      {
+        #[cfg(feature = "zstd-dict")]
+        let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
+        #[cfg(not(feature = "zstd-dict"))]
+        let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
+        lgz::compress(&mmap, &mut enc);
+        enc.finish()?;
+      }
+      #[cfg(not(feature = "zstd"))]
+      lgz::compress(&mmap, &mut buf);
       tarfile.write_u64::<LE>(buf.len() as u64)?;
       tarfile.write_all(&buf)?;
     } else if let Some(n) = (|| {
@@ -160,9 +176,14 @@ pub fn pack(
       tarfile.write_u64::<LE>(n)?;
     } else {
       tarfile.write_u8(COMPRESSION_ZSTD)?;
-      let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
-      enc.write_all(&mmap)?;
-      enc.finish()?;
+      #[cfg(feature = "zstd")]
+      {
+        let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
+        enc.write_all(&mmap)?;
+        enc.finish()?;
+      }
+      #[cfg(not(feature = "zstd"))]
+      buf.extend_from_slice(&mmap);
       tarfile.write_u64::<LE>(buf.len() as u64)?;
       tarfile.write_all(&buf)?;
     }

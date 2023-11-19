@@ -2,8 +2,8 @@
 use leangz::STATS;
 use memmap2::Mmap;
 use std::fs::File;
+use std::io::BufRead;
 use std::io::BufWriter;
-use std::io::Read;
 use std::io::Write;
 #[cfg(feature = "debug")]
 use std::sync::atomic::Ordering;
@@ -128,7 +128,7 @@ fn main() {
         println!("{file}");
       }
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.olean"));
-      let file = File::open(file).unwrap();
+      let file = std::io::BufReader::new(File::open(file).unwrap());
       std::fs::write(outfile, decompressor.decompress(file)).unwrap()
     }
   } else {
@@ -177,7 +177,7 @@ impl Compressor<'_> {
     let outfile = flate2::write::GzEncoder::new(outfile, flate2::Compression::new(7));
     #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
     let outfile = zstd::stream::Encoder::new(outfile, COMPRESSION_LEVEL).unwrap();
-    #[cfg(feature = "zstd-dict")]
+    #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let outfile = zstd::stream::Encoder::with_prepared_dictionary(outfile, &self.dict).unwrap();
     let mut outfile = outfile;
     leangz::lgz::compress(olean, &mut outfile);
@@ -202,15 +202,13 @@ impl Decompressor<'_> {
       _phantom: &(),
     }
   }
-  fn decompress(&self, infile: impl Read) -> Vec<u8> {
+  fn decompress(&self, infile: impl BufRead) -> Vec<u8> {
     #[cfg(feature = "flate2")]
     let infile = flate2::read::GzDecoder::new(infile);
     #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
     let infile = zstd::stream::Decoder::new(infile).unwrap();
-    #[cfg(feature = "zstd-dict")]
-    let infile =
-      zstd::stream::Decoder::with_prepared_dictionary(std::io::BufReader::new(infile), &self.dict)
-        .unwrap();
+    #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+    let infile = zstd::stream::Decoder::with_prepared_dictionary(infile, &self.dict).unwrap();
     leangz::lgz::decompress(infile)
   }
 }
