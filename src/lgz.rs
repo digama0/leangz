@@ -1579,24 +1579,23 @@ impl<R: Read> LgzDecompressor<R> {
     //   d = self.depth,
     // );
     // self.depth += 1;
-    // let res =
+    let pos;
     match tag {
       BIG_CTOR => {
         let ctor = self.file.read_u8().unwrap();
         let num_fields = self.file.read_u8().unwrap();
         let sfields = self.file.read_u16::<LE>().unwrap();
-        self.write_ctor(ctor, num_fields, sfields)
+        pos = self.write_ctor(ctor, num_fields, sfields)
       }
       SAVE => {
         // self.depth -= 1;
-        let pos = self.write_obj();
+        pos = self.write_obj();
         self.backrefs.push(pos);
         // return
-        pos
       }
       tag @ (BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4) => {
         let r = self.read_backref(tag);
-        self.backrefs[r as usize]
+        pos = self.backrefs[r as usize]
       }
       ARRAY => {
         let tag = self.file.read_u8().unwrap();
@@ -1606,29 +1605,26 @@ impl<R: Read> LgzDecompressor<R> {
           let value = self.write_obj();
           self.stack.push(value.into());
         }
-        let pos = self.write_header(tag::ARRAY, 1, 0);
+        pos = self.write_header(tag::ARRAY, 1, 0);
         self.write_u64(size);
         self.write_u64(size);
         self.pop(start);
-        pos
       }
       SCALAR_ARRAY => {
         let tag = self.file.read_u8().unwrap();
         let size = self.read_i64(tag) as u64;
-        let pos = self.write_header(tag::SCALAR_ARRAY, 1, 0);
+        pos = self.write_header(tag::SCALAR_ARRAY, 1, 0);
         self.write_u64(size);
         self.write_u64(size);
         let (_, size2) = pad_to(size as usize, 8);
         self.copy(size as usize, size2);
-        pos
       }
-      STRING => self.write_str(),
+      STRING => pos = self.write_str(),
       MPZ => {
         let tag = self.file.read_u8().unwrap();
         let sign_size = self.read_i64(tag) as i32;
         let capacity = sign_size as u32 & 0x7FFFFFFF;
         let size = (capacity as usize) << 3;
-        let pos;
         if USE_GMP {
           pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
           self.write_u32(capacity);
@@ -1648,46 +1644,40 @@ impl<R: Read> LgzDecompressor<R> {
           self.write_u64(self.pos() + 8);
           self.buf.write_all(&self.temp).unwrap();
         }
-        pos
       }
       tag @ (THUNK | TASK) => {
         let value = self.write_obj();
-        let pos = self.write_header(tag, 1, 0);
+        pos = self.write_header(tag, 1, 0);
         self.write_u64(value);
         self.write_u64(0);
-        pos
       }
       REF => {
         let value = self.write_obj();
-        let pos = self.write_header(tag::TASK, 1, 0);
+        pos = self.write_header(tag::TASK, 1, 0);
         self.write_u64(value);
-        pos
       }
       EXPRISH => {
         // self.depth -= 1;
         // return
-        self.write_exprish()
+        pos = self.write_exprish()
       }
       tag @ ..=0xcf => {
-        const _X: (u8, (u8, u16)) = {
-          let tag = 0x15;
-          (tag >> 4, unpack_ctor(tag))
-        };
         let ctor = tag >> 4;
         let (num_fields, sfields) = unpack_ctor(tag);
-        self.write_ctor(ctor, num_fields, sfields)
+        pos = self.write_ctor(ctor, num_fields, sfields)
       }
-      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) => (self.read_i64(tag) << 1 | 1) as u64,
+      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
+        pos = (self.read_i64(tag) << 1 | 1) as u64,
     }
     // self.depth -= 1;
     // println!(
     //   "{:d$}{start:x}: write_obj[{d}]({:x}) {tag:x} -> {:x?} -> {:x}",
     //   "",
     //   self.file.pos,
-    //   if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) },
+    //   if pos & 1 == 0 { Ok(pos - self.offset) } else { Err(pos >> 1) },
     //   self.buf.len(),
     //   d = self.depth,
     // );
-    // res
+    pos
   }
 }
