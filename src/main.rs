@@ -155,21 +155,19 @@ fn main() {
 #[cfg(feature = "zstd")]
 const COMPRESSION_LEVEL: i32 = 19;
 
-struct Compressor<'a> {
+struct Compressor {
   #[cfg(feature = "zstd-dict")]
-  dict: zstd::dict::EncoderDictionary<'a>,
-  _phantom: &'a (),
+  dict: zstd::dict::EncoderDictionary<'static>,
 }
 
 #[cfg(feature = "zstd-dict")]
 const ZSTD_DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
-impl Compressor<'_> {
+impl Compressor {
   fn new() -> Self {
     Compressor {
       #[cfg(feature = "zstd-dict")]
       dict: zstd::dict::EncoderDictionary::copy(ZSTD_DICT_V1, COMPRESSION_LEVEL),
-      _phantom: &(),
     }
   }
 
@@ -189,18 +187,16 @@ impl Compressor<'_> {
   }
 }
 
-struct Decompressor<'a> {
+struct Decompressor {
   #[cfg(feature = "zstd-dict")]
-  dict: zstd::dict::DecoderDictionary<'a>,
-  _phantom: &'a (),
+  dict: zstd::dict::DecoderDictionary<'static>,
 }
 
-impl Decompressor<'_> {
+impl Decompressor {
   fn new() -> Self {
     Decompressor {
       #[cfg(feature = "zstd-dict")]
       dict: zstd::dict::DecoderDictionary::copy(ZSTD_DICT_V1),
-      _phantom: &(),
     }
   }
   fn decompress(&self, infile: impl BufRead) -> Vec<u8> {
