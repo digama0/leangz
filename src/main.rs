@@ -1,5 +1,5 @@
 #[cfg(feature = "debug")]
-use leangz::STATS;
+use leangz::lgz::STATS;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::BufRead;
@@ -103,24 +103,6 @@ fn main() {
     std::fs::write(outfile, dict).unwrap();
     return
   }
-  #[cfg(feature = "debug")]
-  if do_stats {
-    let compressor = Compressor::new();
-    let mut lgzs = 0;
-    let mut oleans = 0;
-    for file in args {
-      let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
-      let mut out = leangz::WithPosition { r: std::io::sink(), pos: 0 };
-      compressor.compress(&mmap, &mut out);
-      oleans += mmap.len();
-      lgzs += out.pos;
-    }
-    for (i, (n, e)) in STATS.normal.iter().zip(&STATS.exprish).enumerate() {
-      println!("{i:x}: normal {} exprish {}", n.load(Ordering::Relaxed), e.load(Ordering::Relaxed));
-    }
-    println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
-    return
-  }
   if do_decompress {
     let decompressor = Decompressor::new();
     for file in args {
@@ -135,6 +117,25 @@ fn main() {
     let compressor = Compressor::new();
     let mut lgzs = 0;
     let mut oleans = 0;
+    #[cfg(feature = "debug")]
+    if do_stats {
+      for file in args {
+        let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
+        let mut w = leangz::lgz::WithPosition { r: std::io::sink(), pos: 0 };
+        compressor.compress(&mmap, &mut w);
+        oleans += mmap.len();
+        lgzs += w.pos;
+      }
+      for (i, (n, e)) in STATS.normal.iter().zip(&STATS.exprish).enumerate() {
+        println!(
+          "{i:x}: normal {} exprish {}",
+          n.load(Ordering::Relaxed),
+          e.load(Ordering::Relaxed)
+        );
+      }
+      println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
+      return
+    }
     for file in args {
       if verbose {
         println!("{file}");
