@@ -219,8 +219,11 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
       comments.push(std::str::from_utf8(&buf)?.to_string());
       continue
     }
-    tarfile.read_u8()?;
-    let len = tarfile.read_u64::<LE>()?;
+    let len = match tarfile.read_u8()? {
+      COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
+      COMPRESSION_HASH => 8,
+      compression => return Err(UnpackError::UnsupportedCompression(compression)),
+    };
     tarfile.seek(io::SeekFrom::Current(len as _))?;
   }
   Ok(comments)
