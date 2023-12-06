@@ -70,6 +70,9 @@ pub fn unpack<R: BufRead>(
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
       res =>
         if trace == res?.parse::<u64>().map_err(|_| UnpackError::BadTrace)? {
+          if verbose {
+            println!("not unpacking because the trace matches\n{}", trace_path.display());
+          }
           return Ok(trace)
         },
     }
@@ -89,12 +92,13 @@ pub fn unpack<R: BufRead>(
       }
       continue
     };
-    if verbose {
-      println!("copying {}", path.display());
-    }
     let prefix = path.parent().ok_or(UnpackError::BadLtar)?;
     std::fs::create_dir_all(prefix)?;
-    match tarfile.read_u8()? {
+    let compression = tarfile.read_u8()?;
+    if verbose {
+      println!("copying {}, compression = {compression}", path.display());
+    }
+    match compression {
       COMPRESSION_ZSTD => {
         buf.clear();
         buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
