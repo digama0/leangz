@@ -7,7 +7,9 @@ use std::io::Write;
 use std::mem::size_of;
 #[cfg(feature = "debug")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use zerocopy::{AsBytes, FromBytes, LayoutVerified, LE, U16, U32, U64};
+use zerocopy::FromZeroes;
+use zerocopy::Ref;
+use zerocopy::{AsBytes, FromBytes, LE, U16, U32, U64};
 
 const ENABLE_EXPRISH: bool = true;
 
@@ -38,7 +40,7 @@ enum OLeanVersion {
 }
 
 #[repr(C, align(8))]
-#[derive(FromBytes, AsBytes)]
+#[derive(FromZeroes, FromBytes, AsBytes)]
 struct HeaderV0 {
   magic: [u8; 16],
   base: U64<LE>,
@@ -52,7 +54,7 @@ struct Header {
 }
 
 fn parse_as_v0(olean: &[u8]) -> (Header, u64, &[u8]) {
-  let (header, rest) = LayoutVerified::<_, HeaderV0>::new_from_prefix(olean).expect("bad header");
+  let (header, rest) = Ref::<_, HeaderV0>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
@@ -60,7 +62,7 @@ fn parse_as_v0(olean: &[u8]) -> (Header, u64, &[u8]) {
 }
 
 #[repr(C, align(8))]
-#[derive(FromBytes, AsBytes)]
+#[derive(FromZeroes, FromBytes, AsBytes)]
 struct HeaderV1 {
   magic: [u8; 5],
   version: u8,
@@ -71,12 +73,12 @@ struct HeaderV1 {
 }
 
 fn sniff_olean_v0(olean: &[u8]) -> bool {
-  LayoutVerified::<_, HeaderV0>::new_from_prefix(olean)
+  Ref::<_, HeaderV0>::new_from_prefix(olean)
     .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
 }
 
 fn parse_as_v1(olean: &[u8]) -> (Header, u64, &[u8]) {
-  let (header, rest) = LayoutVerified::<_, HeaderV1>::new_from_prefix(olean).expect("bad header");
+  let (header, rest) = Ref::<_, HeaderV1>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"olean");
   assert_eq!(header.version, 1);
   assert_eq!(header.reserved, [0; 2]);
@@ -128,7 +130,7 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
 }
 
 #[repr(C, align(8))]
-#[derive(FromBytes, AsBytes)]
+#[derive(FromZeroes, FromBytes, AsBytes)]
 struct ObjHeader {
   rc: U32<LE>,
   cs_sz: U16<LE>,
@@ -192,8 +194,8 @@ macro_rules! on_leanobj {
   };
 }
 
-fn parse<T: FromBytes>(buf: &[u8], pos: usize) -> (LayoutVerified<&[u8], T>, usize) {
-  let t = LayoutVerified::<_, T>::new_from_prefix(&buf[pos..]).expect("bad header").0;
+fn parse<T: FromBytes>(buf: &[u8], pos: usize) -> (Ref<&[u8], T>, usize) {
+  let t = Ref::<_, T>::new_from_prefix(&buf[pos..]).expect("bad header").0;
   (t, pos + size_of::<T>())
 }
 
@@ -478,8 +480,7 @@ pub fn str_hash(bytes: &[u8]) -> u64 {
   const SEED: u64 = 11;
   let mut h: u64 = SEED ^ (bytes.len() as u64).wrapping_mul(M);
 
-  let (data, rest) =
-    LayoutVerified::<_, [u64]>::new_slice_from_prefix(bytes, bytes.len() / 8).unwrap();
+  let (data, rest) = Ref::<_, [u64]>::new_slice_from_prefix(bytes, bytes.len() / 8).unwrap();
   for &(mut k) in &*data {
     k = k.wrapping_mul(M);
     k ^= k >> R;
