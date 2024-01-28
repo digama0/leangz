@@ -50,80 +50,98 @@ pub fn unpack<R: BufRead>(
   if buf != *b"LTAR" {
     return Err(UnpackError::BadLtar)
   }
-  let trace = tarfile.read_u64::<LE>()?;
-  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
-    buf.clear();
-    tarfile.read_until(0, buf)?;
-    Ok(buf.pop().is_some())
-  };
-  let read_cstr_path =
-    |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<Option<PathBuf>>, UnpackError> {
-      Ok(match read_cstr(buf, tarfile)? {
-        true if buf.is_empty() => Some(None),
-        true => Some(Some(basedir.join(std::str::from_utf8(buf)?))),
-        false => None,
-      })
+  let mut rollback = vec![];
+  let result = (|| {
+    let trace = tarfile.read_u64::<LE>()?;
+    let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
+      buf.clear();
+      tarfile.read_until(0, buf)?;
+      Ok(buf.pop().is_some())
     };
-  let trace_path = read_cstr_path(&mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
-  if !force {
-    match std::fs::read_to_string(&trace_path) {
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-      res =>
-        if trace == res?.parse::<u64>().map_err(|_| UnpackError::BadTrace)? {
-          if verbose {
-            println!("not unpacking because the trace matches\n{}", trace_path.display());
-          }
-          return Ok(trace)
-        },
+    let read_cstr_path =
+      |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<Option<PathBuf>>, UnpackError> {
+        Ok(match read_cstr(buf, tarfile)? {
+          true if buf.is_empty() => Some(None),
+          true => Some(Some(basedir.join(std::str::from_utf8(buf)?))),
+          false => None,
+        })
+      };
+    let trace_path =
+      read_cstr_path(&mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
+    if !force {
+      match std::fs::read_to_string(&trace_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        res =>
+          if trace == res?.parse::<u64>().map_err(|_| UnpackError::BadTrace)? {
+            if verbose {
+              println!("not unpacking because the trace matches\n{}", trace_path.display());
+            }
+            return Ok(trace)
+          },
+      }
     }
-  }
-  let prefix = trace_path.parent().ok_or(UnpackError::BadLtar)?;
-  std::fs::create_dir_all(prefix)?;
-  std::fs::write(trace_path, format!("{trace}"))?;
-  #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-  let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
-  while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
-    let Some(path) = path else {
-      if !read_cstr(&mut buf, &mut tarfile)? {
-        return Err(UnpackError::BadLtar)
-      }
-      if verbose {
-        println!("comment: {}", std::str::from_utf8(&buf)?);
-      }
-      continue
-    };
-    let prefix = path.parent().ok_or(UnpackError::BadLtar)?;
+    let prefix = trace_path.parent().ok_or(UnpackError::BadLtar)?;
     std::fs::create_dir_all(prefix)?;
-    let compression = tarfile.read_u8()?;
-    if verbose {
-      println!("copying {}, compression = {compression}", path.display());
+    std::fs::write(&trace_path, format!("{trace}"))?;
+    rollback.push(trace_path);
+    #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+    let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
+    while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
+      let Some(path) = path else {
+        if !read_cstr(&mut buf, &mut tarfile)? {
+          return Err(UnpackError::BadLtar)
+        }
+        if verbose {
+          println!("comment: {}", std::str::from_utf8(&buf)?);
+        }
+        continue
+      };
+      let prefix = path.parent().ok_or(UnpackError::BadLtar)?;
+      std::fs::create_dir_all(prefix)?;
+      let compression = tarfile.read_u8()?;
+      if verbose {
+        println!("copying {}, compression = {compression}", path.display());
+      }
+      match compression {
+        COMPRESSION_ZSTD => {
+          buf.clear();
+          buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+          tarfile.read_exact(&mut buf)?;
+          let reader = std::io::Cursor::new(&*buf);
+          #[cfg(feature = "zstd")]
+          let reader = zstd::stream::Decoder::new(reader)?;
+          let mut file = File::create(&path)?;
+          rollback.push(path);
+          std::io::copy(&mut { reader }, &mut file)?;
+        }
+        COMPRESSION_LGZ => {
+          buf.clear();
+          buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+          tarfile.read_exact(&mut buf)?;
+          let reader = std::io::Cursor::new(&*buf);
+          #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+          let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
+          #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
+          let reader = zstd::stream::Decoder::new(reader)?;
+          let mut file = File::create(&path)?;
+          rollback.push(path);
+          file.write_all(&lgz::decompress(reader))?;
+        }
+        COMPRESSION_HASH => {
+          std::fs::write(&path, format!("{}", tarfile.read_u64::<LE>()?))?;
+          rollback.push(path);
+        }
+        compression => return Err(UnpackError::UnsupportedCompression(compression)),
+      }
     }
-    match compression {
-      COMPRESSION_ZSTD => {
-        buf.clear();
-        buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-        tarfile.read_exact(&mut buf)?;
-        let reader = std::io::Cursor::new(&*buf);
-        #[cfg(feature = "zstd")]
-        let reader = zstd::stream::Decoder::new(reader)?;
-        std::io::copy(&mut { reader }, &mut File::create(path)?)?;
-      }
-      COMPRESSION_LGZ => {
-        buf.clear();
-        buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-        tarfile.read_exact(&mut buf)?;
-        let reader = std::io::Cursor::new(&*buf);
-        #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-        let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
-        #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
-        let reader = zstd::stream::Decoder::new(reader)?;
-        std::fs::write(path, &lgz::decompress(reader))?;
-      }
-      COMPRESSION_HASH => std::fs::write(path, format!("{}", tarfile.read_u64::<LE>()?))?,
-      compression => return Err(UnpackError::UnsupportedCompression(compression)),
+    Ok(trace)
+  })();
+  if result.is_err() {
+    for file in rollback {
+      let _ = std::fs::remove_file(file);
     }
   }
-  Ok(trace)
+  result
 }
 
 pub fn pack(
