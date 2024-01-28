@@ -1,7 +1,9 @@
 use leangz::ltar;
+use leangz::ltar::UnpackError;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
+use std::io;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -15,6 +17,7 @@ fn main() {
   let mut force = false;
   let mut from_stdin = false;
   let mut json_stdin = true;
+  let mut delete_corrupted = true;
   let mut basedir = None;
   let mut args = std::env::args();
   args.next();
@@ -35,6 +38,10 @@ fn main() {
       }
       "-j" => {
         json_stdin = true;
+        args.next();
+      }
+      "-r" | "--delete-corrupted" => {
+        delete_corrupted = true;
         args.next();
       }
       "--jobs" => {
@@ -122,8 +129,20 @@ fn main() {
         e => BufReader::new(e.unwrap()),
       };
       if let Err(e) = ltar::unpack(basedir, tarfile, force, verbose) {
-        eprintln!("{file}: {e}");
-        fail()
+        if matches!(&e, UnpackError::IOError(e)
+          if matches!(e.kind(), io::ErrorKind::UnexpectedEof))
+        {
+          if delete_corrupted {
+            eprintln!("{file}: removing corrupted file");
+            let _ = std::fs::remove_file(file);
+          } else {
+            eprintln!("{file}: file is corrupted, try deleting or redownloading it");
+            fail()
+          }
+        } else {
+          eprintln!("{file}: {e}");
+          fail()
+        }
       }
     });
     std::process::exit(*error.get_mut() as i32);
