@@ -10,7 +10,43 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 fn main() {
-  let help = || panic!("usage: leantar [-v] [-d|-x] [-C BASEDIR] OUT.ltar FILE.trace [FILE ...]");
+  let help = || {
+    eprintln!(
+      "leantar {} lean (de)compression utility\
+      \n\
+      \nusage:\
+      \n* leantar [OPTS] {{-d,-x}} [FILE.ltar ...]\
+      \n  Decompress each file FILE.ltar into the current directory.\
+      \n  * If one of the arguments is '-', then additional files are read from stdin.\
+      \n\
+      \n* leantar [OPTS] OUT.ltar FILE.trace [(FILE | -c COMMENT) ...]\
+      \n  Compress files FILE.trace and FILE ... into OUT.ltar\
+      \n  * -c COMMENT will add a comment to the file which can be recovered using -k\
+      \n\
+      \n* leantar [OPTS] -k FILE.ltar\
+      \n  Unpack comments in FILE.ltar\
+      \n\
+      \ngeneral options:\
+      \n  --version   Prints the version and exits\
+      \n  --help      Prints the help and exits\
+      \n  -v          Show verbose information\
+      \n  -C <DIR>    Use DIR instead of current dir as extraction base\
+      \n              (can be overridden per-file with the JSON input)\
+      \n\
+      \ndecompress opts:\
+      \n  -f          Always unpack even if a matching trace file exists\
+      \n  -j          Expect stdin input in JSON format\
+      \n  -r, --delete-corrupted\
+      \n              Delete input FILE.ltar files if they fail parsing\
+      \n  --jobs <N>  Unpack files with N threads (default: num CPUs)",
+      env!("CARGO_PKG_VERSION")
+    )
+  };
+  let help_err = |s: &str| {
+    eprintln!("error: {s}");
+    help();
+    std::process::exit(1)
+  };
   let mut do_decompress = false;
   let mut do_show_comments = false;
   let mut verbose = false;
@@ -27,6 +63,10 @@ fn main() {
       "--version" => {
         println!("leantar {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
+      }
+      "--help" => {
+        help();
+        std::process::exit(0)
       }
       "-v" => {
         verbose = true;
@@ -46,7 +86,11 @@ fn main() {
       }
       "--jobs" => {
         args.next();
-        let jobs = args.next().unwrap_or_else(help).parse::<usize>().unwrap();
+        let jobs = args
+          .next()
+          .unwrap_or_else(|| help_err("--jobs missing argument"))
+          .parse::<usize>()
+          .unwrap();
         ThreadPoolBuilder::new().num_threads(jobs).build_global().unwrap();
       }
       "-d" | "-x" => {
@@ -55,8 +99,9 @@ fn main() {
       }
       "-C" => {
         args.next();
-        if basedir.replace(args.next().unwrap_or_else(help)).is_some() {
-          help();
+        if basedir.replace(args.next().unwrap_or_else(|| help_err("-C missing argument"))).is_some()
+        {
+          help_err("duplicate -C argument");
         }
       }
       "-k" => {
@@ -68,7 +113,7 @@ fn main() {
   }
   let basedir = PathBuf::from(basedir.unwrap_or_else(|| ".".into()));
   if do_show_comments {
-    let file = args.next().unwrap_or_else(help);
+    let file = args.next().unwrap_or_else(|| help_err("expected FILE.ltar"));
     let tarfile = match File::open(&file) {
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
         eprintln!("{file} not found");
@@ -147,8 +192,8 @@ fn main() {
     });
     std::process::exit(*error.get_mut() as i32);
   } else {
-    let tarfile = args.next().unwrap_or_else(help);
-    let trace_path = args.next().unwrap_or_else(help);
+    let tarfile = args.next().unwrap_or_else(|| help_err("expected OUT.ltar"));
+    let trace_path = args.next().unwrap_or_else(|| help_err("expected FILE.trace"));
     let tarfile = BufWriter::new(File::create(tarfile).unwrap());
     ltar::pack(&basedir, tarfile, &trace_path, args, verbose).unwrap()
   }
