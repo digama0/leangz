@@ -80,8 +80,20 @@ pub fn unpack<R: BufRead>(
           },
       }
     }
-    let prefix = trace_path.parent().ok_or(UnpackError::BadLtar)?;
-    std::fs::create_dir_all(prefix)?;
+    let mut cached_create_dir_all = {
+      // Unpacked files tend to reuse the same folders for multiple files,
+      // so cache the last directory so that we don't call the OS so much
+      // for `create_dir_all`. See #3
+      let mut prefix: Option<PathBuf> = None;
+      move |dir: &Path| {
+        if !prefix.as_deref().is_some_and(|d| d == dir) {
+          std::fs::create_dir_all(dir)?;
+          prefix = Some(dir.to_owned());
+        }
+        Ok::<_, io::Error>(())
+      }
+    };
+    cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
     std::fs::write(&trace_path, format!("{trace}"))?;
     rollback.push(trace_path);
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
@@ -96,8 +108,7 @@ pub fn unpack<R: BufRead>(
         }
         continue
       };
-      let prefix = path.parent().ok_or(UnpackError::BadLtar)?;
-      std::fs::create_dir_all(prefix)?;
+      cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
       let compression = tarfile.read_u8()?;
       if verbose {
         println!("copying {}, compression = {compression}", path.display());
