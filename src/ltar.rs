@@ -1,5 +1,6 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, BufRead, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,8 @@ const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
 const COMPRESSION_ZSTD: u8 = 0;
 const COMPRESSION_LGZ: u8 = 1;
-const COMPRESSION_HASH: u8 = 2;
+const COMPRESSION_HASH_PLAIN: u8 = 2;
+const COMPRESSION_HASH_JSON: u8 = 3;
 
 pub enum UnpackError {
   IOError(io::Error),
@@ -42,14 +44,87 @@ impl From<std::str::Utf8Error> for UnpackError {
   fn from(v: std::str::Utf8Error) -> Self { Self::InvalidUtf8(v) }
 }
 
+#[derive(Clone, Copy)]
+enum LtarVersion {
+  V1,
+  V2,
+}
+
+impl TryFrom<&str> for Hash {
+  type Error = std::num::ParseIntError;
+  fn try_from(value: &str) -> Result<Self, Self::Error> { value.parse().map(Hash) }
+}
+#[derive(Deserialize)]
+#[serde(try_from = "&str")]
+struct Hash(u64);
+impl Serialize for Hash {
+  fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+  where S: serde::Serializer {
+    ser.serialize_str(&self.0.to_string())
+  }
+}
+
+#[derive(Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum Level {
+  Trace,
+  Info,
+  Warning,
+  Error,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Message {
+  message: String,
+  level: Level,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildTraceV2 {
+  log: Vec<Message>,
+  dep_hash: Hash,
+}
+
+enum BuildTrace {
+  V1(u64),
+  V2(BuildTraceV2),
+}
+impl BuildTrace {
+  fn hash(&self) -> u64 {
+    match self {
+      BuildTrace::V1(n) => *n,
+      BuildTrace::V2(b) => b.dep_hash.0,
+    }
+  }
+}
+
+fn read_trace_file(trace_path: &Path) -> Result<Option<BuildTrace>, UnpackError> {
+  let res = match std::fs::read_to_string(trace_path) {
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    res => res?,
+  };
+  Ok(Some(if let Ok(n) = res.parse::<u64>() {
+    BuildTrace::V1(n)
+  } else {
+    BuildTrace::V2(serde_json::de::from_str(&res).map_err(|_| UnpackError::BadTrace)?)
+  }))
+}
+
 pub fn unpack<R: BufRead>(
   basedir: &Path, mut tarfile: R, force: bool, verbose: bool,
 ) -> Result<u64, UnpackError> {
-  let mut buf = vec![0; 4];
-  tarfile.read_exact(&mut buf)?;
-  if buf != *b"LTAR" {
-    return Err(UnpackError::BadLtar)
-  }
+  let version = {
+    let mut buf = [0; 4];
+    tarfile.read_exact(&mut buf)?;
+    match &buf {
+      b"LTAR" => LtarVersion::V1,
+      b"LTR2" => LtarVersion::V2,
+      _ => return Err(UnpackError::BadLtar),
+    }
+  };
+  let mut buf = vec![];
   let mut rollback = vec![];
   let result = (|| {
     let trace = tarfile.read_u64::<LE>()?;
@@ -69,15 +144,13 @@ pub fn unpack<R: BufRead>(
     let trace_path =
       read_cstr_path(&mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
     if !force {
-      match std::fs::read_to_string(&trace_path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        res =>
-          if trace == res?.parse::<u64>().map_err(|_| UnpackError::BadTrace)? {
-            if verbose {
-              println!("not unpacking because the trace matches\n{}", trace_path.display());
-            }
-            return Ok(trace)
-          },
+      if let Some(b) = read_trace_file(&trace_path)? {
+        if trace == b.hash() {
+          if verbose {
+            println!("not unpacking because the trace matches\n{}", trace_path.display());
+          }
+          return Ok(trace)
+        }
       }
     }
     let mut cached_create_dir_all = {
@@ -93,56 +166,27 @@ pub fn unpack<R: BufRead>(
         Ok::<_, io::Error>(())
       }
     };
-    cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
-    std::fs::write(&trace_path, format!("{trace}"))?;
-    rollback.push(trace_path);
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
+    cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
+    match version {
+      LtarVersion::V1 => {
+        std::fs::write(&trace_path, format!("{trace}"))?;
+        rollback.push(trace_path);
+      }
+      LtarVersion::V2 =>
+        unpack_one(&mut tarfile, verbose, trace_path, &mut buf, &mut rollback, &dict)?,
+    }
     while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
-      let Some(path) = path else {
-        if !read_cstr(&mut buf, &mut tarfile)? {
-          return Err(UnpackError::BadLtar)
-        }
+      if let Some(path) = path {
+        cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
+        unpack_one(&mut tarfile, verbose, path, &mut buf, &mut rollback, &dict)?;
+      } else if read_cstr(&mut buf, &mut tarfile)? {
         if verbose {
           println!("comment: {}", std::str::from_utf8(&buf)?);
         }
-        continue
-      };
-      cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
-      let compression = tarfile.read_u8()?;
-      if verbose {
-        println!("copying {}, compression = {compression}", path.display());
-      }
-      match compression {
-        COMPRESSION_ZSTD => {
-          buf.clear();
-          buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-          tarfile.read_exact(&mut buf)?;
-          let reader = std::io::Cursor::new(&*buf);
-          #[cfg(feature = "zstd")]
-          let reader = zstd::stream::Decoder::new(reader)?;
-          let mut file = File::create(&path)?;
-          rollback.push(path);
-          std::io::copy(&mut { reader }, &mut file)?;
-        }
-        COMPRESSION_LGZ => {
-          buf.clear();
-          buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-          tarfile.read_exact(&mut buf)?;
-          let reader = std::io::Cursor::new(&*buf);
-          #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-          let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, &dict)?;
-          #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
-          let reader = zstd::stream::Decoder::new(reader)?;
-          let mut file = File::create(&path)?;
-          rollback.push(path);
-          file.write_all(&lgz::decompress(reader))?;
-        }
-        COMPRESSION_HASH => {
-          std::fs::write(&path, format!("{}", tarfile.read_u64::<LE>()?))?;
-          rollback.push(path);
-        }
-        compression => return Err(UnpackError::UnsupportedCompression(compression)),
+      } else {
+        return Err(UnpackError::BadLtar)
       }
     }
     Ok(trace)
@@ -155,18 +199,85 @@ pub fn unpack<R: BufRead>(
   result
 }
 
+fn unpack_one<R: BufRead>(
+  tarfile: &mut R, verbose: bool, path: PathBuf, buf: &mut Vec<u8>, rollback: &mut Vec<PathBuf>,
+  dict: &zstd::dict::DecoderDictionary<'_>,
+) -> Result<(), UnpackError> {
+  let compression = tarfile.read_u8()?;
+  if verbose {
+    println!("copying {}, compression = {compression}", path.display());
+  }
+  match compression {
+    COMPRESSION_ZSTD => {
+      buf.clear();
+      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+      tarfile.read_exact(buf)?;
+      let reader = std::io::Cursor::new(&**buf);
+      #[cfg(feature = "zstd")]
+      let reader = zstd::stream::Decoder::new(reader)?;
+      let mut file = File::create(&path)?;
+      rollback.push(path);
+      std::io::copy(&mut { reader }, &mut file)?;
+    }
+    COMPRESSION_LGZ => {
+      buf.clear();
+      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+      tarfile.read_exact(buf)?;
+      let reader = std::io::Cursor::new(&**buf);
+      #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+      let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
+      #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
+      let reader = zstd::stream::Decoder::new(reader)?;
+      let mut file = File::create(&path)?;
+      rollback.push(path);
+      file.write_all(&lgz::decompress(reader))?;
+    }
+    COMPRESSION_HASH_PLAIN => {
+      std::fs::write(&path, format!("{}", tarfile.read_u64::<LE>()?))?;
+      rollback.push(path);
+    }
+    COMPRESSION_HASH_JSON => {
+      let b = BuildTraceV2 { log: vec![], dep_hash: Hash(tarfile.read_u64::<LE>()?) };
+      std::fs::write(&path, serde_json::to_vec(&b).unwrap())?;
+      rollback.push(path);
+    }
+    compression => return Err(UnpackError::UnsupportedCompression(compression)),
+  }
+  Ok(())
+}
+
 pub fn pack(
   basedir: &Path, mut tarfile: impl Write, trace_path: &str,
   args: impl IntoIterator<Item = String>, verbose: bool,
 ) -> io::Result<()> {
-  let trace = std::fs::read_to_string(basedir.join(trace_path))?;
-  let trace = trace.parse::<u64>().expect("expected .trace file");
-  tarfile.write_all(b"LTAR")?;
-  tarfile.write_u64::<LE>(trace)?;
+  let (version, trace) = match read_trace_file(&basedir.join(trace_path)) {
+    Ok(None) => panic!("expected .trace file"),
+    Err(UnpackError::IOError(e)) => return Err(e),
+    Err(_) => panic!("bad .trace file"),
+    Ok(Some(BuildTrace::V1(n))) =>
+      (LtarVersion::V1, BuildTraceV2 { log: vec![], dep_hash: Hash(n) }),
+    Ok(Some(BuildTrace::V2(mut b))) => {
+      b.log.retain(|it| it.level >= Level::Info);
+      (LtarVersion::V2, b)
+    }
+  };
+  tarfile.write_all(match version {
+    LtarVersion::V1 => b"LTAR",
+    LtarVersion::V2 => b"LTR2",
+  })?;
+  tarfile.write_u64::<LE>(trace.dep_hash.0)?;
   tarfile.write_all(trace_path.as_bytes())?;
   tarfile.write_u8(0)?;
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
+  if let LtarVersion::V2 = version {
+    if trace.log.is_empty() {
+      tarfile.write_u8(COMPRESSION_HASH_JSON)?;
+      tarfile.write_u64::<LE>(trace.dep_hash.0)?;
+    } else {
+      pack_zstd(&serde_json::to_vec(&trace)?, &mut tarfile)?;
+    }
+  }
   let mut it = args.into_iter();
   while let Some(file) = it.next() {
     if file == "-c" {
@@ -183,8 +294,8 @@ pub fn pack(
       println!("compressing {}", path.display());
     }
     let mmap = unsafe { Mmap::map(&File::open(path)?)? };
-    let mut buf = vec![];
     if mmap.get(..5) == Some(b"olean") {
+      let mut buf = vec![];
       tarfile.write_u8(COMPRESSION_LGZ)?;
       #[cfg(feature = "zstd")]
       {
@@ -205,22 +316,28 @@ pub fn pack(
       }
       std::str::from_utf8(&mmap).ok()?.parse::<u64>().ok()
     })() {
-      tarfile.write_u8(COMPRESSION_HASH)?;
+      tarfile.write_u8(COMPRESSION_HASH_PLAIN)?;
       tarfile.write_u64::<LE>(n)?;
     } else {
-      tarfile.write_u8(COMPRESSION_ZSTD)?;
-      #[cfg(feature = "zstd")]
-      {
-        let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
-        enc.write_all(&mmap)?;
-        enc.finish()?;
-      }
-      #[cfg(not(feature = "zstd"))]
-      buf.extend_from_slice(&mmap);
-      tarfile.write_u64::<LE>(buf.len() as u64)?;
-      tarfile.write_all(&buf)?;
+      pack_zstd(&mmap, &mut tarfile)?;
     }
   }
+  Ok(())
+}
+
+fn pack_zstd(data: &[u8], tarfile: &mut impl Write) -> io::Result<()> {
+  tarfile.write_u8(COMPRESSION_ZSTD)?;
+  let mut buf = vec![];
+  #[cfg(feature = "zstd")]
+  {
+    let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
+    enc.write_all(data)?;
+    enc.finish()?;
+  }
+  #[cfg(not(feature = "zstd"))]
+  buf.extend_from_slice(data);
+  tarfile.write_u64::<LE>(buf.len() as u64)?;
+  tarfile.write_all(&buf)?;
   Ok(())
 }
 
@@ -250,7 +367,7 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
     }
     let len = match tarfile.read_u8()? {
       COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
-      COMPRESSION_HASH => 8,
+      COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
       compression => return Err(UnpackError::UnsupportedCompression(compression)),
     };
     tarfile.seek(io::SeekFrom::Current(len as _))?;

@@ -1,6 +1,6 @@
 [package]
 name = "leangz"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 default-run = "leangz"
 
@@ -22,6 +22,7 @@ hashbrown = "0.14"
 flate2 = { version = "1.0", optional = true }
 zstd = { version = "0.13", optional = true }
 rayon = "1.7"
+serde = { version = "1.0.194", default-features = false, features = ["derive"] }
 serde_json = "1.0"
 
 [[bin]]
