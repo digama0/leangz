@@ -21,7 +21,6 @@ pub enum UnpackError {
   IOError(io::Error),
   InvalidUtf8(std::str::Utf8Error),
   BadLtar,
-  BadTrace,
   UnsupportedCompression(u8),
 }
 
@@ -31,7 +30,6 @@ impl std::fmt::Display for UnpackError {
       UnpackError::IOError(e) => e.fmt(f),
       UnpackError::InvalidUtf8(e) => e.fmt(f),
       UnpackError::BadLtar => write!(f, "bad .ltar file"),
-      UnpackError::BadTrace => write!(f, "bad .trace file"),
       UnpackError::UnsupportedCompression(c) => write!(f, "unsupported compression {c}"),
     }
   }
@@ -90,26 +88,32 @@ struct BuildTraceV2 {
 enum BuildTrace {
   V1(u64),
   V2(BuildTraceV2),
+  Bad,
+  Missing,
 }
 impl BuildTrace {
-  fn hash(&self) -> u64 {
+  fn hash(&self) -> Option<u64> {
     match self {
-      BuildTrace::V1(n) => *n,
-      BuildTrace::V2(b) => b.dep_hash.0,
+      BuildTrace::V1(n) => Some(*n),
+      BuildTrace::V2(b) => Some(b.dep_hash.0),
+      _ => None,
     }
   }
 }
 
-fn read_trace_file(trace_path: &Path) -> Result<Option<BuildTrace>, UnpackError> {
+fn read_trace_file(trace_path: &Path) -> Result<BuildTrace, io::Error> {
   let res = match std::fs::read_to_string(trace_path) {
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BuildTrace::Missing),
     res => res?,
   };
-  Ok(Some(if let Ok(n) = res.parse::<u64>() {
+  Ok(if let Ok(n) = res.parse::<u64>() {
     BuildTrace::V1(n)
   } else {
-    BuildTrace::V2(serde_json::de::from_str(&res).map_err(|_| UnpackError::BadTrace)?)
-  }))
+    match serde_json::de::from_str(&res) {
+      Ok(b) => BuildTrace::V2(b),
+      _ => BuildTrace::Bad,
+    }
+  })
 }
 
 pub fn unpack<R: BufRead>(
@@ -144,13 +148,12 @@ pub fn unpack<R: BufRead>(
     let trace_path =
       read_cstr_path(&mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
     if !force {
-      if let Some(b) = read_trace_file(&trace_path)? {
-        if trace == b.hash() {
-          if verbose {
-            println!("not unpacking because the trace matches\n{}", trace_path.display());
-          }
-          return Ok(trace)
+      let b = read_trace_file(&trace_path)?;
+      if Some(trace) == b.hash() {
+        if verbose {
+          println!("not unpacking because the trace matches\n{}", trace_path.display());
         }
+        return Ok(trace)
       }
     }
     let mut cached_create_dir_all = {
@@ -250,13 +253,11 @@ pub fn pack(
   basedir: &Path, mut tarfile: impl Write, trace_path: &str,
   args: impl IntoIterator<Item = String>, verbose: bool,
 ) -> io::Result<()> {
-  let (version, trace) = match read_trace_file(&basedir.join(trace_path)) {
-    Ok(None) => panic!("expected .trace file"),
-    Err(UnpackError::IOError(e)) => return Err(e),
-    Err(_) => panic!("bad .trace file"),
-    Ok(Some(BuildTrace::V1(n))) =>
-      (LtarVersion::V1, BuildTraceV2 { log: vec![], dep_hash: Hash(n) }),
-    Ok(Some(BuildTrace::V2(mut b))) => {
+  let (version, trace) = match read_trace_file(&basedir.join(trace_path))? {
+    BuildTrace::Missing => panic!("expected .trace file"),
+    BuildTrace::Bad => panic!("bad .trace file"),
+    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV2 { log: vec![], dep_hash: Hash(n) }),
+    BuildTrace::V2(mut b) => {
       b.log.retain(|it| it.level >= Level::Info);
       (LtarVersion::V2, b)
     }
