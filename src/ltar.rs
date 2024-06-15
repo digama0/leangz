@@ -116,18 +116,20 @@ fn read_trace_file(trace_path: &Path) -> Result<BuildTrace, io::Error> {
   })
 }
 
+fn get_version<R: BufRead>(tarfile: &mut R) -> Result<LtarVersion, UnpackError> {
+  let mut buf = [0; 4];
+  tarfile.read_exact(&mut buf)?;
+  Ok(match &buf {
+    b"LTAR" => LtarVersion::V1,
+    b"LTR2" => LtarVersion::V2,
+    _ => return Err(UnpackError::BadLtar),
+  })
+}
+
 pub fn unpack<R: BufRead>(
   basedir: &Path, mut tarfile: R, force: bool, verbose: bool,
 ) -> Result<u64, UnpackError> {
-  let version = {
-    let mut buf = [0; 4];
-    tarfile.read_exact(&mut buf)?;
-    match &buf {
-      b"LTAR" => LtarVersion::V1,
-      b"LTR2" => LtarVersion::V2,
-      _ => return Err(UnpackError::BadLtar),
-    }
-  };
+  let version = get_version(&mut tarfile)?;
   let mut buf = vec![];
   let mut rollback = vec![];
   let result = (|| {
@@ -343,19 +345,28 @@ fn pack_zstd(data: &[u8], tarfile: &mut impl Write) -> io::Result<()> {
 }
 
 pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, UnpackError> {
-  let mut buf = vec![0; 4];
-  tarfile.read_exact(&mut buf)?;
-  if buf != *b"LTAR" {
-    return Err(UnpackError::BadLtar)
-  }
+  let version = get_version(&mut tarfile)?;
+  let mut buf = vec![];
   tarfile.read_u64::<LE>()?;
   let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
     buf.clear();
     tarfile.read_until(0, buf)?;
     Ok(buf.pop().is_some())
   };
+  fn skip_one<R: BufRead + Seek>(tarfile: &mut R) -> Result<(), UnpackError> {
+    let len = match tarfile.read_u8()? {
+      COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
+      COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
+      compression => return Err(UnpackError::UnsupportedCompression(compression)),
+    };
+    tarfile.seek(io::SeekFrom::Current(len as _))?;
+    Ok(())
+  }
   if !read_cstr(&mut buf, &mut tarfile)? {
     return Err(UnpackError::BadLtar)
+  }
+  if let LtarVersion::V2 = version {
+    skip_one(&mut tarfile)?
   }
   let mut comments = vec![];
   while read_cstr(&mut buf, &mut tarfile)? {
@@ -366,12 +377,7 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
       comments.push(std::str::from_utf8(&buf)?.to_string());
       continue
     }
-    let len = match tarfile.read_u8()? {
-      COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
-      COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
-      compression => return Err(UnpackError::UnsupportedCompression(compression)),
-    };
-    tarfile.seek(io::SeekFrom::Current(len as _))?;
+    skip_one(&mut tarfile)?;
   }
   Ok(comments)
 }
