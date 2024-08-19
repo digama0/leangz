@@ -26,13 +26,19 @@ pub static STATS: Stats = {
   Stats { normal: [NEW; 256], exprish: [NEW; 256] }
 };
 
-const USE_GMP: bool = if cfg!(feature = "gmp") {
-  true
-} else if cfg!(feature = "no-gmp") {
-  false
-} else {
-  cfg!(target_family = "unix") && cfg!(target_arch = "x86_64")
-};
+fn use_gmp(mac_v2: bool) -> bool {
+  if cfg!(feature = "gmp") {
+    true
+  } else if cfg!(feature = "no-gmp") {
+    false
+  } else if cfg!(target_family = "unix") && cfg!(target_arch = "x86_64") {
+    true
+  } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+    !mac_v2
+  } else {
+    false
+  }
+}
 
 enum OLeanVersion {
   V0,
@@ -53,12 +59,13 @@ struct Header {
   root: u64,
 }
 
-fn parse_as_v0(olean: &[u8]) -> (Header, u64, &[u8]) {
+fn parse_as_v0(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
   let (header, rest) = Ref::<_, HeaderV0>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
-  (Header { base, githash: [0; 40], root: header.root.get() }, offset, rest)
+  let cfg = Config { use_gmp: use_gmp(false) };
+  (cfg, Header { base, githash: [0; 40], root: header.root.get() }, offset, rest)
 }
 
 #[repr(C, align(8))]
@@ -77,7 +84,27 @@ fn sniff_olean_v0(olean: &[u8]) -> bool {
     .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
 }
 
-fn parse_as_v1(olean: &[u8]) -> (Header, u64, &[u8]) {
+fn is_mac_v2(githash: &[u8; 40]) -> bool {
+  if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+    matches!(
+      githash,
+      b"be6c4894e0a6c542d56a6f4bb1238087267d21a0" // v4.9.0-rc1
+      | b"7ed9b73f4d4c994b603cd369758c79eacdafc62f" // v4.9.0-rc2
+      | b"141856d6e6d808a85b9147a530294fee8e48e15f" // v4.9.0-rc3
+      | b"8f9843a4a5fe1b0c2f24c74097f296e2818771ee" // v4.9.0
+      | b"1b78cb4836cf626007bd38872956a6fab8910993" // v4.9.1
+      | b"3b58e0649156610ce3aeed4f7b5c652340c668d4" // v4.10.0-rc1
+      | b"702c31b8071269f0052fd1e0fb3891a079a655bd" // v4.10.0-rc2
+      | b"c375e19f6b656fcd594cdca3a38b8578634df8cd" // v4.10.0
+      | b"daa22187642d4cf6954c39a23eab20d8a8675416" // v4.11.0-rc1
+      | b"0edf1bac392f7e2fe0266b28b51c498306363a84" // v4.11.0-rc2
+    )
+  } else {
+    false
+  }
+}
+
+fn parse_as_v1(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
   let (header, rest) = Ref::<_, HeaderV1>::new_from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"olean");
   assert_eq!(header.version, 1);
@@ -86,11 +113,17 @@ fn parse_as_v1(olean: &[u8]) -> (Header, u64, &[u8]) {
   let offset = base + size_of::<HeaderV1>() as u64;
   let mut githash = [0; 40];
   githash.copy_from_slice(&header.githash);
-  (Header { base, githash, root: header.root.get() }, offset, rest)
+  let cfg = Config { use_gmp: use_gmp(is_mac_v2(&header.githash)) };
+  (cfg, Header { base, githash, root: header.root.get() }, offset, rest)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Config {
+  use_gmp: bool,
 }
 
 pub fn compress(olean: &[u8], outfile: impl Write) {
-  let (version, (Header { githash, base, root }, offset, rest)) = if sniff_olean_v0(olean) {
+  let (version, (cfg, Header { githash, base, root }, offset, rest)) = if sniff_olean_v0(olean) {
     (OLeanVersion::V0, parse_as_v0(olean))
   } else {
     (OLeanVersion::V1, parse_as_v1(olean))
@@ -99,13 +132,14 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
   let mut refs = vec![0u8; rest.len() >> 3];
   let mut pos = 0;
   while pos < rest.len() {
-    pos = on_subobjs(rest, pos, |ptr| {
+    pos = on_subobjs(cfg, rest, pos, |ptr| {
       let b = &mut refs[(ptr - offset) as usize >> 3];
       *b = b.saturating_add(1);
     });
     pos = pad_to(pos, 8).1;
   }
   let mut w = LgzWriter {
+    cfg,
     file: WithPosition { r: outfile, pos: 0 },
     refs: &refs,
     offset,
@@ -199,7 +233,7 @@ fn parse<T: FromBytes>(buf: &[u8], pos: usize) -> (Ref<&[u8], T>, usize) {
   (t, pos + size_of::<T>())
 }
 
-fn on_subobjs(buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
+fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
   let (header, pos) = parse::<ObjHeader>(buf, pos0);
   debug_assert!(header.rc.get() == 0);
   match header.tag {
@@ -223,7 +257,7 @@ fn on_subobjs(buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
       pos + capacity as usize
     }
     tag::MPZ =>
-      if USE_GMP {
+      if cfg.use_gmp {
         let (capacity, pos) = parse_u32(buf, pos);
         let (size, pos) = parse_i32(buf, pos);
         debug_assert!(
@@ -278,6 +312,7 @@ fn on_array_subobjs(buf: &[u8], size: u64, mut pos: usize, mut f: impl FnMut(u64
 }
 
 struct LgzWriter<'a, W> {
+  cfg: Config,
   buf: &'a [u8],
   file: WithPosition<W>,
   depth: usize,
@@ -509,13 +544,13 @@ enum LgzMode {
   Exprish,
 }
 
-fn get_num_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+fn get_num_hash(cfg: Config, buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   if ptr & 1 == 1 {
     Some(ptr >> 1)
   } else {
     let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
     if header.tag == tag::MPZ {
-      if USE_GMP {
+      if cfg.use_gmp {
         let (_capacity, pos) = parse_u32(buf, pos);
         let (sign_size, pos) = parse_i32(buf, pos);
         let (_limbs_ptr, pos) = parse_u64(buf, pos);
@@ -621,13 +656,13 @@ fn get_expr_data(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   }
   None
 }
-fn get_lit_hash(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+fn get_lit_hash(cfg: Config, buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   if ptr & 1 != 0 {
     return None
   }
   let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
   match header.tag {
-    0 => get_num_hash(buf, offset, parse_u64(buf, pos).0),
+    0 => get_num_hash(cfg, buf, offset, parse_u64(buf, pos).0),
     1 => get_str_hash(buf, offset, parse_u64(buf, pos).0),
     _ => None,
   }
@@ -914,7 +949,7 @@ impl<W: Write> LgzWriter<'_, W> {
       (0, 1, 1) => {
         // Expr.bvar
         let (ptr, pos) = parse_u64(self.buf, pos);
-        if exprish::expr_bvar_data(get_num_hash(self.buf, self.offset, ptr)?)
+        if exprish::expr_bvar_data(get_num_hash(self.cfg, self.buf, self.offset, ptr)?)
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_BVAR);
@@ -996,7 +1031,7 @@ impl<W: Write> LgzWriter<'_, W> {
         // Expr.lit
         let _p0 = pos - size_of::<ObjHeader>();
         let (ptr, pos) = parse_u64(self.buf, pos);
-        let hash = get_lit_hash(self.buf, self.offset, ptr)?;
+        let hash = get_lit_hash(self.cfg, self.buf, self.offset, ptr)?;
         if exprish::expr_lit_data(hash) == parse_u64(self.buf, pos).0 {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_LIT);
           self.write_obj(ptr, LgzMode::Normal);
@@ -1029,7 +1064,7 @@ impl<W: Write> LgzWriter<'_, W> {
         let (ptr3, pos) = parse_u64(self.buf, pos);
         if exprish::expr_proj_data(
           get_name_hash(self.buf, self.offset, ptr1)?,
-          get_num_hash(self.buf, self.offset, ptr2)?,
+          get_num_hash(self.cfg, self.buf, self.offset, ptr2)?,
           get_expr_data(self.buf, self.offset, ptr3)?,
         ) == parse_u64(self.buf, pos).0
         {
@@ -1116,7 +1151,7 @@ impl<W: Write> LgzWriter<'_, W> {
         self.file.write_all(s2).unwrap();
       }
       tag::MPZ => {
-        let (capacity, sign_size, pos) = if USE_GMP {
+        let (capacity, sign_size, pos) = if self.cfg.use_gmp {
           let (capacity, pos) = parse_u32(self.buf, pos);
           let (sign_size, pos) = parse_u32(self.buf, pos);
           let (_limbs_ptr, pos) = parse_u64(self.buf, pos);
@@ -1192,6 +1227,7 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
   };
   let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
   let mut w = LgzDecompressor {
+    cfg: Config { use_gmp: use_gmp(false) },
     buf: Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize),
     file: WithPosition { r: infile, pos: 8 },
     offset: base,
@@ -1207,6 +1243,9 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
       w.buf.push(1);
       let mut githash_in = [0; 40];
       w.file.read_exact(&mut githash_in).unwrap();
+      if is_mac_v2(&githash_in) {
+        w.cfg.use_gmp = use_gmp(true)
+      }
       w.buf.extend_from_slice(&githash_in);
       w.buf.extend_from_slice(&[0; 2]);
     }
@@ -1254,6 +1293,7 @@ impl<W: Write> Write for WithPosition<W> {
 }
 
 struct LgzDecompressor<R> {
+  cfg: Config,
   file: WithPosition<R>,
   buf: Vec<u8>,
   // depth: usize,
@@ -1467,7 +1507,9 @@ impl<R: Read> LgzDecompressor<R> {
         let ptr = self.write_obj();
         let pos = self.write_ctor_header(0, 1, 1);
         self.write_u64(ptr);
-        self.write_u64(exprish::expr_bvar_data(get_num_hash(&self.buf, self.offset, ptr).unwrap()));
+        self.write_u64(exprish::expr_bvar_data(
+          get_num_hash(self.cfg, &self.buf, self.offset, ptr).unwrap(),
+        ));
         pos
       }
       exprish::EXPR_FVAR => {
@@ -1498,7 +1540,9 @@ impl<R: Read> LgzDecompressor<R> {
         let ptr = self.write_obj();
         let pos = self.write_ctor_header(9, 1, 1);
         self.write_u64(ptr);
-        self.write_u64(exprish::expr_lit_data(get_lit_hash(&self.buf, self.offset, ptr).unwrap()));
+        self.write_u64(exprish::expr_lit_data(
+          get_lit_hash(self.cfg, &self.buf, self.offset, ptr).unwrap(),
+        ));
         pos
       }
       exprish::EXPR_MDATA => {
@@ -1522,7 +1566,7 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr3);
         self.write_u64(exprish::expr_proj_data(
           get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
-          get_num_hash(&self.buf, self.offset, ptr2).unwrap(),
+          get_num_hash(self.cfg, &self.buf, self.offset, ptr2).unwrap(),
           get_expr_data(&self.buf, self.offset, ptr3).unwrap(),
         ));
         pos
@@ -1704,7 +1748,7 @@ impl<R: Read> LgzDecompressor<R> {
         let sign_size = self.read_i64(tag) as i32;
         let capacity = sign_size as u32 & 0x7FFFFFFF;
         let size = (capacity as usize) << 3;
-        if USE_GMP {
+        if self.cfg.use_gmp {
           pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
           self.write_u32(capacity);
           self.write_u32(sign_size as u32);
