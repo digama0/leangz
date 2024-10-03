@@ -98,6 +98,11 @@ fn is_mac_v2(githash: &[u8; 40]) -> bool {
       | b"c375e19f6b656fcd594cdca3a38b8578634df8cd" // v4.10.0
       | b"daa22187642d4cf6954c39a23eab20d8a8675416" // v4.11.0-rc1
       | b"0edf1bac392f7e2fe0266b28b51c498306363a84" // v4.11.0-rc2
+      | b"c122849f0759797734971b6ff4dfa82f01c653c6" // v4.11.0-rc3
+      | b"ec3042d94bd11a42430f9e14d39e26b1f880f99b" // v4.11.0
+      | b"e9e858a4484905a0bfe97c4f05c3924ead02eed8" // v4.12.0-rc1
+      | b"dc2533473114eb8656439ff2b9335209784aa640" // v4.12.0
+      | b"4cb90dddfcb8ceda2b89711d567d593e1fd07090" // v4.13.0-rc1
     )
   } else {
     false
