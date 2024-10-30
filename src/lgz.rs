@@ -59,7 +59,10 @@ struct RegularLeanVersion {
   major: u8,
   minor: u8,
   patch: u8,
-  rc_m1: u8, // note: numbers are shifted by 1 so stable is at the end
+  /// Numbers are shifted so that lex order works:
+  /// * release candidate N: `rc_m1 = N-1`
+  /// * stable: `rc_m1 = 0xFF`
+  rc_m1: u8,
 }
 
 enum LeanVersion {
@@ -76,6 +79,8 @@ impl LeanVersion {
       let end = s.iter().position(|&c| c == b'.')?;
       let minor: u8 = std::str::from_utf8(&s[..end]).ok()?.parse().ok()?;
       let s = &s[end + 1..];
+      let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+      let s = &s[..end];
       let end = s.iter().position(|&c| c == b'-').unwrap_or(s.len());
       let patch: u8 = std::str::from_utf8(&s[..end]).ok()?.parse().ok()?;
       let rc: u8 = if let Some(rest) = s[end..].strip_prefix(b"-rc") {
@@ -88,11 +93,11 @@ impl LeanVersion {
     .map_or_else(|| LeanVersion::Unknown(*lean_version), LeanVersion::Regular)
   }
 
-  fn encode(major: u8, minor: u8, patch: u8, rc: u8) -> String {
-    if rc == u8::MAX {
+  fn encode(major: u8, minor: u8, patch: u8, rc_m1: u8) -> String {
+    if rc_m1 == u8::MAX {
       format!("{major}.{minor}.{patch}")
     } else {
-      format!("{major}.{minor}.{patch}-rc{rc}")
+      format!("{major}.{minor}.{patch}-rc{}", rc_m1 + 1)
     }
   }
 }
@@ -257,7 +262,7 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
       w.file.write_u8(cfg.use_gmp as u8).unwrap();
       match lean_version {
         LeanVersion::Regular(v) => {
-          w.file.write_all(&[v.major, v.minor, v.patch, v.rc_m1.wrapping_add(1)]).unwrap();
+          w.file.write_all(&[v.major, v.minor, v.patch, v.rc_m1]).unwrap();
         }
         LeanVersion::Unknown(v) => {
           w.file.write_u8(0).unwrap();
@@ -1373,8 +1378,8 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
       } else {
         let minor = w.file.read_u8().unwrap();
         let patch = w.file.read_u8().unwrap();
-        let rc = w.file.read_u8().unwrap();
-        let lean_version = LeanVersion::encode(major, minor, patch, rc);
+        let rc_m1 = w.file.read_u8().unwrap();
+        let lean_version = LeanVersion::encode(major, minor, patch, rc_m1);
         lean_version_in[..lean_version.len()].copy_from_slice(lean_version.as_bytes());
       }
       w.buf.extend_from_slice(&lean_version_in);

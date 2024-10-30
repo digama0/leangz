@@ -164,7 +164,7 @@ pub fn unpack<R: BufRead>(
       // for `create_dir_all`. See #3
       let mut prefix: Option<PathBuf> = None;
       move |dir: &Path| {
-        if !prefix.as_deref().is_some_and(|d| d == dir) {
+        if prefix.as_deref().is_none_or(|d| d != dir) {
           std::fs::create_dir_all(dir)?;
           prefix = Some(dir.to_owned());
         }
@@ -179,13 +179,28 @@ pub fn unpack<R: BufRead>(
         std::fs::write(&trace_path, format!("{trace}"))?;
         rollback.push(trace_path);
       }
-      LtarVersion::V2 =>
-        unpack_one(&mut tarfile, verbose, trace_path, &mut buf, &mut rollback, &dict)?,
+      LtarVersion::V2 => unpack_one(
+        &mut tarfile,
+        verbose,
+        trace_path,
+        &mut buf,
+        &mut rollback,
+        #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+        &dict,
+      )?,
     }
     while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
       if let Some(path) = path {
         cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
-        unpack_one(&mut tarfile, verbose, path, &mut buf, &mut rollback, &dict)?;
+        unpack_one(
+          &mut tarfile,
+          verbose,
+          path,
+          &mut buf,
+          &mut rollback,
+          #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+          &dict,
+        )?;
       } else if read_cstr(&mut buf, &mut tarfile)? {
         if verbose {
           println!("comment: {}", std::str::from_utf8(&buf)?);
@@ -206,7 +221,7 @@ pub fn unpack<R: BufRead>(
 
 fn unpack_one<R: BufRead>(
   tarfile: &mut R, verbose: bool, path: PathBuf, buf: &mut Vec<u8>, rollback: &mut Vec<PathBuf>,
-  dict: &zstd::dict::DecoderDictionary<'_>,
+  #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
 ) -> Result<(), UnpackError> {
   let compression = tarfile.read_u8()?;
   if verbose {
