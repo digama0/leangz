@@ -43,6 +43,7 @@ fn use_gmp(mac_v2: bool) -> bool {
 enum OLeanVersion {
   V0,
   V1,
+  V2,
 }
 
 #[repr(C, align(8))]
@@ -53,7 +54,50 @@ struct HeaderV0 {
   root: U64<LE>,
 }
 
+#[derive(PartialOrd, Ord, PartialEq, Eq)]
+struct RegularLeanVersion {
+  major: u8,
+  minor: u8,
+  patch: u8,
+  rc_m1: u8, // note: numbers are shifted by 1 so stable is at the end
+}
+
+enum LeanVersion {
+  Regular(RegularLeanVersion),
+  Unknown([u8; 33]),
+}
+
+impl LeanVersion {
+  const UNKNOWN: Self = Self::Unknown([0; 33]);
+
+  fn parse(lean_version: &[u8; 33]) -> LeanVersion {
+    (|| -> Option<RegularLeanVersion> {
+      let s = lean_version.strip_prefix(b"4.")?;
+      let end = s.iter().position(|&c| c == b'.')?;
+      let minor: u8 = std::str::from_utf8(&s[..end]).ok()?.parse().ok()?;
+      let s = &s[end + 1..];
+      let end = s.iter().position(|&c| c == b'-').unwrap_or(s.len());
+      let patch: u8 = std::str::from_utf8(&s[..end]).ok()?.parse().ok()?;
+      let rc: u8 = if let Some(rest) = s[end..].strip_prefix(b"-rc") {
+        std::str::from_utf8(rest).ok()?.parse().ok()?
+      } else {
+        0
+      };
+      Some(RegularLeanVersion { major: 4, minor, patch, rc_m1: rc.wrapping_sub(1) })
+    })()
+    .map_or_else(|| LeanVersion::Unknown(*lean_version), LeanVersion::Regular)
+  }
+
+  fn encode(major: u8, minor: u8, patch: u8, rc: u8) -> String {
+    if rc == u8::MAX {
+      format!("{major}.{minor}.{patch}")
+    } else {
+      format!("{major}.{minor}.{patch}-rc{rc}")
+    }
+  }
+}
 struct Header {
+  lean_version: LeanVersion,
   githash: [u8; 40],
   base: u64,
   root: u64,
@@ -65,7 +109,8 @@ fn parse_as_v0(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
   let cfg = Config { use_gmp: use_gmp(false) };
-  (cfg, Header { base, githash: [0; 40], root: header.root.get() }, offset, rest)
+  let lean_version = LeanVersion::UNKNOWN;
+  (cfg, Header { base, lean_version, githash: [0; 40], root: header.root.get() }, offset, rest)
 }
 
 #[repr(C, align(8))]
@@ -79,12 +124,7 @@ struct HeaderV1 {
   root: U64<LE>,
 }
 
-fn sniff_olean_v0(olean: &[u8]) -> bool {
-  Ref::<_, HeaderV0>::new_from_prefix(olean)
-    .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
-}
-
-fn is_mac_v2(githash: &[u8; 40]) -> bool {
+fn mac_v1_use_gmp(githash: &[u8; 40]) -> bool {
   if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
     matches!(
       githash,
@@ -103,6 +143,9 @@ fn is_mac_v2(githash: &[u8; 40]) -> bool {
       | b"e9e858a4484905a0bfe97c4f05c3924ead02eed8" // v4.12.0-rc1
       | b"dc2533473114eb8656439ff2b9335209784aa640" // v4.12.0
       | b"4cb90dddfcb8ceda2b89711d567d593e1fd07090" // v4.13.0-rc1
+      | b"b1b73a444f9b13c003ad9dd05881c44e9861a827" // v4.13.0-rc2
+      | b"01d414ac36dc28f3e424dabd36d818873fea655c" // v4.13.0-rc3
+      | b"480d7314a2c499f670609b2c2623a79d36cea760" // v4.13.0-rc4
     )
   } else {
     false
@@ -118,8 +161,48 @@ fn parse_as_v1(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
   let offset = base + size_of::<HeaderV1>() as u64;
   let mut githash = [0; 40];
   githash.copy_from_slice(&header.githash);
-  let cfg = Config { use_gmp: use_gmp(is_mac_v2(&header.githash)) };
-  (cfg, Header { base, githash, root: header.root.get() }, offset, rest)
+  let cfg = Config { use_gmp: use_gmp(mac_v1_use_gmp(&header.githash)) };
+  let lean_version = LeanVersion::UNKNOWN;
+  (cfg, Header { base, lean_version, githash, root: header.root.get() }, offset, rest)
+}
+
+#[repr(C, align(8))]
+#[derive(FromZeroes, FromBytes, AsBytes)]
+struct HeaderV2 {
+  magic: [u8; 5],
+  version: u8,
+  flags: u8,
+  lean_version: [u8; 33],
+  githash: [u8; 40],
+  base: U64<LE>,
+  root: U64<LE>,
+}
+
+fn parse_as_v2(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
+  let (header, rest) = Ref::<_, HeaderV2>::new_from_prefix(olean).expect("bad header");
+  assert_eq!(&header.magic, b"olean");
+  assert_eq!(header.version, 2);
+  assert_eq!(header.flags & !1, 0);
+  let base = header.base.get();
+  let offset = base + size_of::<HeaderV2>() as u64;
+  let mut githash = [0; 40];
+  githash.copy_from_slice(&header.githash);
+  let cfg = Config { use_gmp: header.flags != 0 };
+  let lean_version = LeanVersion::parse(&header.lean_version);
+  (cfg, Header { base, lean_version, githash, root: header.root.get() }, offset, rest)
+}
+
+fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
+  if Ref::<_, HeaderV0>::new_from_prefix(olean)
+    .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
+  {
+    return OLeanVersion::V0
+  }
+  match Ref::<_, HeaderV1>::new_from_prefix(olean).expect("bad header").0.version {
+    1 => OLeanVersion::V1,
+    2 => OLeanVersion::V2,
+    v => panic!("unexpected olean version: {v}"),
+  }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -128,10 +211,12 @@ struct Config {
 }
 
 pub fn compress(olean: &[u8], outfile: impl Write) {
-  let (version, (cfg, Header { githash, base, root }, offset, rest)) = if sniff_olean_v0(olean) {
-    (OLeanVersion::V0, parse_as_v0(olean))
-  } else {
-    (OLeanVersion::V1, parse_as_v1(olean))
+  let version = sniff_olean_version(olean);
+
+  let (cfg, Header { githash, lean_version, base, root }, offset, rest) = match version {
+    OLeanVersion::V0 => parse_as_v0(olean),
+    OLeanVersion::V1 => parse_as_v1(olean),
+    OLeanVersion::V2 => parse_as_v2(olean),
   };
   assert!(base & !((u32::MAX as u64) << 16) == 0);
   let mut refs = vec![0u8; rest.len() >> 3];
@@ -163,6 +248,22 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
       w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
       w.file.write_u64::<LE>(olean.len() as u64).unwrap();
       w.file.write_all(&githash).unwrap();
+    }
+    OLeanVersion::V2 => {
+      w.file.write_all(&MAGIC2).unwrap();
+      w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
+      w.file.write_u64::<LE>(olean.len() as u64).unwrap();
+      w.file.write_all(&githash).unwrap();
+      w.file.write_u8(cfg.use_gmp as u8).unwrap();
+      match lean_version {
+        LeanVersion::Regular(v) => {
+          w.file.write_all(&[v.major, v.minor, v.patch, v.rc_m1.wrapping_add(1)]).unwrap();
+        }
+        LeanVersion::Unknown(v) => {
+          w.file.write_u8(0).unwrap();
+          w.file.write_all(&v).unwrap();
+        }
+      }
     }
   }
   w.write_obj(root, LgzMode::Normal);
@@ -330,6 +431,7 @@ pub const NAME_ANON_HASH: u64 = 1723;
 
 pub(crate) const MAGIC0: [u8; 4] = *b"LGZ!";
 pub(crate) const MAGIC1: [u8; 4] = *b"LGZ1";
+pub(crate) const MAGIC2: [u8; 4] = *b"LGZ2";
 
 // These are valid in normal and exprish mode
 pub(crate) const UINT0: u8 = 0xd0;
@@ -1220,12 +1322,14 @@ impl<W: Write> LgzWriter<'_, W> {
 enum LgzVersion {
   V0,
   V1,
+  V2,
 }
 
 pub fn decompress(mut infile: impl Read) -> Vec<u8> {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
   let version = match magic {
+    MAGIC2 => LgzVersion::V2,
     MAGIC1 => LgzVersion::V1,
     MAGIC0 => LgzVersion::V0,
     _ => panic!("unrecognized LGZ version"),
@@ -1248,11 +1352,33 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
       w.buf.push(1);
       let mut githash_in = [0; 40];
       w.file.read_exact(&mut githash_in).unwrap();
-      if is_mac_v2(&githash_in) {
+      if mac_v1_use_gmp(&githash_in) {
         w.cfg.use_gmp = use_gmp(true)
       }
       w.buf.extend_from_slice(&githash_in);
       w.buf.extend_from_slice(&[0; 2]);
+    }
+    LgzVersion::V2 => {
+      w.buf.extend_from_slice(b"olean");
+      w.buf.push(2);
+      let mut githash_in = [0; 40];
+      w.file.read_exact(&mut githash_in).unwrap();
+      let flags = w.file.read_u8().unwrap();
+      w.cfg.use_gmp = flags & 1 != 0;
+      w.buf.push(w.cfg.use_gmp as u8);
+      let mut lean_version_in = [0; 33];
+      let major = w.file.read_u8().unwrap();
+      if major == 0 {
+        w.file.read_exact(&mut lean_version_in).unwrap();
+      } else {
+        let minor = w.file.read_u8().unwrap();
+        let patch = w.file.read_u8().unwrap();
+        let rc = w.file.read_u8().unwrap();
+        let lean_version = LeanVersion::encode(major, minor, patch, rc);
+        lean_version_in[..lean_version.len()].copy_from_slice(lean_version.as_bytes());
+      }
+      w.buf.extend_from_slice(&lean_version_in);
+      w.buf.extend_from_slice(&githash_in);
     }
   }
   w.buf.write_u64::<LE>(base).unwrap();
