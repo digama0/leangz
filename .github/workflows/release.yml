@@ -35,23 +35,25 @@ jobs:
       RUSTFLAGS: ${{ matrix.RUSTFLAGS }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
       - name: Test
         if: matrix.target != 'aarch64-apple-darwin'
         run: |
-          ${{ matrix.cross && 'cross' || 'cargo' }} test \
-            --release --locked --target ${{ matrix.target }}
+          ${{ matrix.cross && 'cross' || 'cargo' }} test --release --locked --target ${{ matrix.target }}
 
       - name: Build
         run: |
-          ${{ matrix.cross && 'cross' || 'cargo' }} build \
-            --release --locked --target ${{ matrix.target }}
+          ${{ matrix.cross && 'cross' || 'cargo' }} build --release --locked --target ${{ matrix.target }}
 
       - name: Strip release binary (linux and macos)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin'
