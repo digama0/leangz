@@ -1,15 +1,11 @@
-use byteorder::ByteOrder;
-use byteorder::ReadBytesExt;
-use byteorder::WriteBytesExt;
+use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt, LE};
 use hashbrown::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
 #[cfg(feature = "debug")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use zerocopy::FromZeroes;
-use zerocopy::Ref;
-use zerocopy::{AsBytes, FromBytes, LE, U16, U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref, LE as ZLE, U16, U32, U64};
 
 const ENABLE_EXPRISH: bool = true;
 
@@ -47,11 +43,11 @@ enum OLeanVersion {
 }
 
 #[repr(C, align(8))]
-#[derive(FromZeroes, FromBytes, AsBytes)]
+#[derive(KnownLayout, Immutable, FromBytes, IntoBytes)]
 struct HeaderV0 {
   magic: [u8; 16],
-  base: U64<LE>,
-  root: U64<LE>,
+  base: U64<ZLE>,
+  root: U64<ZLE>,
 }
 
 #[derive(PartialOrd, Ord, PartialEq, Eq)]
@@ -109,7 +105,7 @@ struct Header {
 }
 
 fn parse_as_v0(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
-  let (header, rest) = Ref::<_, HeaderV0>::new_from_prefix(olean).expect("bad header");
+  let (header, rest) = Ref::<_, HeaderV0>::from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
@@ -119,14 +115,14 @@ fn parse_as_v0(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
 }
 
 #[repr(C, align(8))]
-#[derive(FromZeroes, FromBytes, AsBytes)]
+#[derive(KnownLayout, Immutable, FromBytes)]
 struct HeaderV1 {
   magic: [u8; 5],
   version: u8,
   githash: [u8; 40],
   reserved: [u8; 2],
-  base: U64<LE>,
-  root: U64<LE>,
+  base: U64<ZLE>,
+  root: U64<ZLE>,
 }
 
 fn mac_v1_use_gmp(githash: &[u8; 40]) -> bool {
@@ -159,7 +155,7 @@ fn mac_v1_use_gmp(githash: &[u8; 40]) -> bool {
 }
 
 fn parse_as_v1(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
-  let (header, rest) = Ref::<_, HeaderV1>::new_from_prefix(olean).expect("bad header");
+  let (header, rest) = Ref::<_, HeaderV1>::from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"olean");
   assert_eq!(header.version, 1);
   assert_eq!(header.reserved, [0; 2]);
@@ -173,19 +169,19 @@ fn parse_as_v1(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
 }
 
 #[repr(C, align(8))]
-#[derive(FromZeroes, FromBytes, AsBytes)]
+#[derive(KnownLayout, Immutable, FromBytes)]
 struct HeaderV2 {
   magic: [u8; 5],
   version: u8,
   flags: u8,
   lean_version: [u8; 33],
   githash: [u8; 40],
-  base: U64<LE>,
-  root: U64<LE>,
+  base: U64<ZLE>,
+  root: U64<ZLE>,
 }
 
 fn parse_as_v2(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
-  let (header, rest) = Ref::<_, HeaderV2>::new_from_prefix(olean).expect("bad header");
+  let (header, rest) = Ref::<_, HeaderV2>::from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"olean");
   assert_eq!(header.version, 2);
   assert_eq!(header.flags & !1, 0);
@@ -199,12 +195,12 @@ fn parse_as_v2(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
 }
 
 fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
-  if Ref::<_, HeaderV0>::new_from_prefix(olean)
+  if Ref::<_, HeaderV0>::from_prefix(olean)
     .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
   {
     return OLeanVersion::V0
   }
-  match Ref::<_, HeaderV1>::new_from_prefix(olean).expect("bad header").0.version {
+  match Ref::<_, HeaderV1>::from_prefix(olean).expect("bad header").0.version {
     1 => OLeanVersion::V1,
     2 => OLeanVersion::V2,
     v => panic!("unexpected olean version: {v}"),
@@ -276,10 +272,10 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
 }
 
 #[repr(C, align(8))]
-#[derive(FromZeroes, FromBytes, AsBytes)]
+#[derive(KnownLayout, Immutable, FromBytes, IntoBytes)]
 struct ObjHeader {
-  rc: U32<LE>,
-  cs_sz: U16<LE>,
+  rc: U32<ZLE>,
+  cs_sz: U16<ZLE>,
   num_fields: u8,
   tag: u8,
 }
@@ -340,8 +336,8 @@ macro_rules! on_leanobj {
   };
 }
 
-fn parse<T: FromBytes>(buf: &[u8], pos: usize) -> (Ref<&[u8], T>, usize) {
-  let t = Ref::<_, T>::new_from_prefix(&buf[pos..]).expect("bad header").0;
+fn parse<T: KnownLayout + Immutable>(buf: &[u8], pos: usize) -> (Ref<&[u8], T>, usize) {
+  let t = Ref::<_, T>::from_prefix(&buf[pos..]).expect("bad header").0;
   (t, pos + size_of::<T>())
 }
 
@@ -628,7 +624,7 @@ pub fn str_hash(bytes: &[u8]) -> u64 {
   const SEED: u64 = 11;
   let mut h: u64 = SEED ^ (bytes.len() as u64).wrapping_mul(M);
 
-  let (data, rest) = Ref::<_, [u64]>::new_slice_from_prefix(bytes, bytes.len() / 8).unwrap();
+  let (data, rest) = Ref::<_, [u64]>::from_prefix_with_elems(bytes, bytes.len() / 8).unwrap();
   for &(mut k) in &*data {
     k = k.wrapping_mul(M);
     k ^= k >> R;
@@ -1436,7 +1432,7 @@ struct LgzDecompressor<R> {
   // depth: usize,
   offset: u64,
   backrefs: Vec<u64>,
-  stack: Vec<U64<LE>>,
+  stack: Vec<U64<ZLE>>,
   temp: Vec<u8>,
 }
 
