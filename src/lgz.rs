@@ -151,6 +151,7 @@ fn mac_v1_use_gmp(githash: &[u8; 40]) -> bool {
       | b"b1b73a444f9b13c003ad9dd05881c44e9861a827" // v4.13.0-rc2
       | b"01d414ac36dc28f3e424dabd36d818873fea655c" // v4.13.0-rc3
       | b"480d7314a2c499f670609b2c2623a79d36cea760" // v4.13.0-rc4
+      | b"6d22e0e5cc5a4392466e3d6dd8522486d1fd038b" // v4.13.0
     )
   } else {
     false
