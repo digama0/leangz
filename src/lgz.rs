@@ -196,7 +196,7 @@ fn parse_as_v2(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
 
 fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
   if Ref::<_, HeaderV0>::from_prefix(olean)
-    .map_or(false, |(header, _)| header.magic == *b"oleanfile!!!!!!!")
+    .is_ok_and(|(header, _)| header.magic == *b"oleanfile!!!!!!!")
   {
     return OLeanVersion::V0
   }
@@ -315,6 +315,7 @@ fn pad_to(pos: usize, n: u8) -> (usize, usize) {
 }
 
 mod tag {
+  pub(crate) const PROMISE: u8 = 244;
   pub(crate) const CLOSURE: u8 = 245;
   pub(crate) const ARRAY: u8 = 246;
   pub(crate) const STRUCT_ARRAY: u8 = 247;
@@ -343,24 +344,24 @@ fn parse<T: KnownLayout + Immutable>(buf: &[u8], pos: usize) -> (Ref<&[u8], T>, 
 
 fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> usize {
   let (header, pos) = parse::<ObjHeader>(buf, pos0);
-  debug_assert!(header.rc.get() == 0);
+  assert!(header.rc.get() == 0);
   match header.tag {
     tag::ARRAY => {
       let (size, pos) = parse_u64(buf, pos);
       let (capacity, pos) = parse_u64(buf, pos);
-      debug_assert!(size == capacity && header.cs_sz.get() == 1 && header.num_fields == 0);
+      assert!(size == capacity && header.cs_sz.get() == 1 && header.num_fields == 0);
       on_array_subobjs(buf, size, pos, f)
     }
     tag::SCALAR_ARRAY => {
       let (size, pos) = parse_u64(buf, pos);
       let (capacity, pos) = parse_u64(buf, pos);
-      debug_assert!(header.cs_sz.get() == 1 && size == capacity);
+      assert!(header.cs_sz.get() == 1 && size == capacity);
       pos + capacity as usize
     }
     tag::STRING => {
       let (size, pos) = parse_u64(buf, pos);
       let (capacity, pos) = parse_u64(buf, pos);
-      debug_assert!(header.cs_sz.get() == 1 && size == capacity);
+      assert!(header.cs_sz.get() == 1 && size == capacity);
       let (_length, pos) = parse_u64(buf, pos);
       pos + capacity as usize
     }
@@ -368,7 +369,7 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
       if cfg.use_gmp {
         let (capacity, pos) = parse_u32(buf, pos);
         let (size, pos) = parse_i32(buf, pos);
-        debug_assert!(
+        assert!(
           header.cs_sz.get() == ((capacity + 3) as u16) << 3
             && size.unsigned_abs() == capacity
             && capacity != 0
@@ -378,20 +379,20 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
       } else {
         let (sign, pos) = parse_u64(buf, pos);
         let (size, pos) = parse_u64(buf, pos);
-        debug_assert!(header.cs_sz.get() == ((size + 8) as u16) << 2 && sign < 2 && size != 0);
+        assert!(header.cs_sz.get() == ((size + 8) as u16) << 2 && sign < 2 && size != 0);
         let (_limbs_ptr, pos) = parse_u64(buf, pos);
         pos + (4 * size) as usize
       },
     tag::THUNK | tag::TASK => {
       let (value, pos) = parse_u64(buf, pos);
       let (imp, pos) = parse_u64(buf, pos);
-      debug_assert!(header.cs_sz.get() == 1 && imp == 0);
+      assert!(header.cs_sz.get() == 3 << 3 && imp == 0);
       on_leanobj!(f, value);
       pos
     }
-    tag::REF => {
+    tag::REF | tag::PROMISE => {
       let (value, pos) = parse_u64(buf, pos);
-      debug_assert!(header.cs_sz.get() == 1);
+      assert!(header.cs_sz.get() == 2 << 3);
       on_leanobj!(f, value);
       pos
     }
@@ -401,9 +402,7 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
     tag::RESERVED => panic!("reserved"),
     _ctor => {
       let len_except_sfields = 8 + 8 * header.num_fields as usize;
-      debug_assert!(
-        len_except_sfields <= header.cs_sz.get() as usize && header.cs_sz.get() & 7 == 0
-      );
+      assert!(len_except_sfields <= header.cs_sz.get() as usize && header.cs_sz.get() & 7 == 0);
       on_array_subobjs(buf, header.num_fields.into(), pos, f);
       pos0 + header.cs_sz.get() as usize
     }
@@ -459,6 +458,7 @@ pub(crate) const THUNK: u8 = 0x50;
 pub(crate) const TASK: u8 = 0x60;
 pub(crate) const REF: u8 = 0x70;
 pub(crate) const EXPRISH: u8 = 0x80;
+pub(crate) const PROMISE: u8 = 0x90;
 
 // only valid in exprish mode
 pub(crate) mod exprish {
@@ -475,7 +475,7 @@ pub(crate) mod exprish {
   pub(crate) const LEVEL_PARAM: u8 = 0x05;
   pub(crate) const LEVEL_MVAR: u8 = 0x06;
   pub(crate) const fn pack_level_data(h: u32, depth: u32, bits: u8) -> u64 {
-    (h as u64) | (bits as u64) << 32 | (depth as u64) << 40
+    (h as u64) | ((bits as u64) << 32) | ((depth as u64) << 40)
   }
   pub(crate) const fn unpack_level_data(data: u64) -> (u32, u32, u8) {
     (data as u32, (data >> 40) as u32, (data >> 32) as u8)
@@ -523,10 +523,10 @@ pub(crate) mod exprish {
   pub(crate) const EXPR_CONST_APP_END: u8 = EXPR_CONST_APP + 0x1f;
 
   pub(crate) const fn pack_expr_data(h: u64, bvars: u32, depth: u8, bits: u8) -> u64 {
-    (h as u32 as u64) | (depth as u64) << 32 | (bits as u64) << 40 | (bvars as u64) << 44
+    (h as u32 as u64) | ((depth as u64) << 32) | ((bits as u64) << 40) | ((bvars as u64) << 44)
   }
   pub(crate) const fn unpack_expr_data(data: u64) -> (u64, u32, u8, u8) {
-    (data as u32 as u64, (data >> 44) as u32, (data >> 32) as u8, (data >> 40 & 15) as u8)
+    (data as u32 as u64, (data >> 44) as u32, (data >> 32) as u8, ((data >> 40) & 15) as u8)
   }
 
   pub(crate) const fn expr_const_data(hash1: u64, hash2: u64, bits2: u8) -> u64 {
@@ -585,10 +585,10 @@ pub(crate) const fn pack_ctor(ctor: u8, num_fields: u8, sfields: u16) -> Option<
   // This encoding works for all constructors in the Lean library
   let lo = match (ctor, num_fields, sfields) {
     (_, 0, 0) => return None, // unused anyway because these are enum-like
-    (..=12, ..=7, ..=1) => num_fields << 1 | sfields as u8,
+    (..=12, ..=7, ..=1) => (num_fields << 1) | sfields as u8,
     _ => return None,
   };
-  Some(ctor << 4 | lo)
+  Some((ctor << 4) | lo)
 }
 pub(crate) const fn unpack_ctor(tag: u8) -> (u8, u16) {
   let n = tag & 15;
@@ -1219,7 +1219,7 @@ impl<W: Write> LgzWriter<'_, W> {
     // println!(
     //   "{:d$}{:x}: write {:?}[{d}]({:x}) {:x?}, {}, {} (save = {save})",
     //   "",
-    //   (ptr - self.offset + 0x20) as usize,
+    //   (ptr - self.offset) as usize + size_of::<HeaderV2>(),
     //   mode,
     //   self.file.pos,
     //   header.tag,
@@ -1279,8 +1279,15 @@ impl<W: Write> LgzWriter<'_, W> {
         self.write_i64(LgzMode::Normal, sign_size.into());
         self.file.write_all(&self.buf[pos..][..8 * capacity]).unwrap();
       }
-      tag::THUNK | tag::TASK | tag::REF => {
-        self.write_op(mode, LgzMode::Normal, header.tag);
+      tag::THUNK | tag::TASK | tag::REF | tag::PROMISE => {
+        let tag = match header.tag {
+          tag::THUNK => THUNK,
+          tag::TASK => TASK,
+          tag::REF => REF,
+          tag::PROMISE => PROMISE,
+          _ => unreachable!(),
+        };
+        self.write_op(mode, LgzMode::Normal, tag);
         let (value, _) = parse_u64(self.buf, pos);
         self.write_obj(value, LgzMode::Normal);
       }
@@ -1310,7 +1317,7 @@ impl<W: Write> LgzWriter<'_, W> {
     // println!(
     //   "{:d$}{:x}: <- write[{d}]({:x}) {:x?}",
     //   "",
-    //   (ptr - self.offset + 0x20) as usize,
+    //   (ptr - self.offset) as usize + size_of::<HeaderV2>(),
     //   self.file.pos,
     //   header.tag,
     //   d = self.depth,
@@ -1798,7 +1805,8 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
 
-      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) => (self.read_i64(tag) << 1 | 1) as u64,
+      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
+        ((self.read_i64(tag) << 1) | 1) as u64,
       SAVE => {
         // self.depth -= 1;
         let pos = self.write_exprish();
@@ -1844,10 +1852,8 @@ impl<R: Read> LgzDecompressor<R> {
         pos = self.write_ctor(ctor, num_fields, sfields)
       }
       SAVE => {
-        // self.depth -= 1;
         pos = self.write_obj();
         self.backrefs.push(pos);
-        // return
       }
       tag @ (BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4) => {
         let r = self.read_backref(tag);
@@ -1901,29 +1907,36 @@ impl<R: Read> LgzDecompressor<R> {
           self.buf.write_all(&self.temp).unwrap();
         }
       }
-      tag @ (THUNK | TASK) => {
+      THUNK => {
         let value = self.write_obj();
-        pos = self.write_header(tag, 1, 0);
+        pos = self.write_header(tag::THUNK, 3 << 3, 0);
+        self.write_u64(value);
+        self.write_u64(0);
+      }
+      TASK => {
+        let value = self.write_obj();
+        pos = self.write_header(tag::TASK, 3 << 3, 0);
         self.write_u64(value);
         self.write_u64(0);
       }
       REF => {
         let value = self.write_obj();
-        pos = self.write_header(tag::TASK, 1, 0);
+        pos = self.write_header(tag::REF, 2 << 3, 0);
         self.write_u64(value);
       }
-      EXPRISH => {
-        // self.depth -= 1;
-        // return
-        pos = self.write_exprish()
+      PROMISE => {
+        let value = self.write_obj();
+        pos = self.write_header(tag::PROMISE, 2 << 3, 0);
+        self.write_u64(value);
       }
+      EXPRISH => pos = self.write_exprish(),
       tag @ ..=0xcf => {
         let ctor = tag >> 4;
         let (num_fields, sfields) = unpack_ctor(tag);
         pos = self.write_ctor(ctor, num_fields, sfields)
       }
       tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
-        pos = (self.read_i64(tag) << 1 | 1) as u64,
+        pos = ((self.read_i64(tag) << 1) | 1) as u64,
     }
     // self.depth -= 1;
     // println!(
