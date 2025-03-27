@@ -81,8 +81,10 @@ impl LeanVersion {
       let patch: u8 = std::str::from_utf8(&s[..end]).ok()?.parse().ok()?;
       let rc: u8 = if let Some(rest) = s[end..].strip_prefix(b"-rc") {
         std::str::from_utf8(rest).ok()?.parse().ok()?
-      } else {
+      } else if s[end..].is_empty() {
         0
+      } else {
+        return None
       };
       Some(RegularLeanVersion { major: 4, minor, patch, rc_m1: rc.wrapping_sub(1) })
     })()
