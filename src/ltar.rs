@@ -2,7 +2,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{self, BufRead, Seek, Write};
+use std::io::{self, BufRead, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::lgz;
@@ -21,6 +21,7 @@ pub enum UnpackError {
   IOError(io::Error),
   InvalidUtf8(std::str::Utf8Error),
   BadLtar,
+  NotEnoughPaths(u8),
   UnsupportedCompression(u8),
 }
 
@@ -30,6 +31,7 @@ impl std::fmt::Display for UnpackError {
       UnpackError::IOError(e) => e.fmt(f),
       UnpackError::InvalidUtf8(e) => e.fmt(f),
       UnpackError::BadLtar => write!(f, "bad .ltar file"),
+      UnpackError::NotEnoughPaths(n) => write!(f, "not enough base paths (expected > {n})"),
       UnpackError::UnsupportedCompression(c) => write!(f, "unsupported compression {c}"),
     }
   }
@@ -42,10 +44,11 @@ impl From<std::str::Utf8Error> for UnpackError {
   fn from(v: std::str::Utf8Error) -> Self { Self::InvalidUtf8(v) }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 enum LtarVersion {
   V1,
   V2,
+  V3,
 }
 
 impl TryFrom<&str> for Hash {
@@ -122,12 +125,13 @@ fn get_version<R: BufRead>(tarfile: &mut R) -> Result<LtarVersion, UnpackError> 
   Ok(match &buf {
     b"LTAR" => LtarVersion::V1,
     b"LTR2" => LtarVersion::V2,
+    b"LTR3" => LtarVersion::V3,
     _ => return Err(UnpackError::BadLtar),
   })
 }
 
 pub fn unpack<R: BufRead>(
-  basedir: &Path, mut tarfile: R, force: bool, verbose: bool,
+  basedir: &[PathBuf], mut tarfile: R, force: bool, verbose: bool,
 ) -> Result<u64, UnpackError> {
   let version = get_version(&mut tarfile)?;
   let mut buf = vec![];
@@ -141,9 +145,22 @@ pub fn unpack<R: BufRead>(
     };
     let read_cstr_path =
       |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<Option<PathBuf>>, UnpackError> {
+        let pathidx = if version < LtarVersion::V3 {
+          0
+        } else {
+          match tarfile.read_u8() {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+            idx => idx?,
+          }
+        };
         Ok(match read_cstr(buf, tarfile)? {
           true if buf.is_empty() => Some(None),
-          true => Some(Some(basedir.join(std::str::from_utf8(buf)?))),
+          true => Some(Some(
+            basedir
+              .get(pathidx as usize)
+              .ok_or(UnpackError::NotEnoughPaths(pathidx))?
+              .join(std::str::from_utf8(buf)?),
+          )),
           false => None,
         })
       };
@@ -174,12 +191,11 @@ pub fn unpack<R: BufRead>(
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
     cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
-    match version {
-      LtarVersion::V1 => {
-        std::fs::write(&trace_path, format!("{trace}"))?;
-        rollback.push(trace_path);
-      }
-      LtarVersion::V2 => unpack_one(
+    if version < LtarVersion::V2 {
+      std::fs::write(&trace_path, format!("{trace}"))?;
+      rollback.push(trace_path);
+    } else {
+      unpack_one(
         &mut tarfile,
         verbose,
         trace_path,
@@ -187,7 +203,7 @@ pub fn unpack<R: BufRead>(
         &mut rollback,
         #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
         &dict,
-      )?,
+      )?
     }
     while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
       if let Some(path) = path {
@@ -267,28 +283,29 @@ fn unpack_one<R: BufRead>(
 }
 
 pub fn pack(
-  basedir: &Path, mut tarfile: impl Write, trace_path: &str,
+  basedirs: &[PathBuf], mut tarfile: impl Write, trace_path: &str,
   args: impl IntoIterator<Item = String>, verbose: bool,
 ) -> io::Result<()> {
-  let (version, trace) = match read_trace_file(&basedir.join(trace_path))? {
+  let (version, trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
     BuildTrace::Missing => panic!("expected .trace file"),
     BuildTrace::Bad => panic!("bad .trace file"),
     BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV2 { log: vec![], dep_hash: Hash(n) }),
     BuildTrace::V2(mut b) => {
       b.log.retain(|it| it.level >= Level::Info);
-      (LtarVersion::V2, b)
+      (if basedirs.len() == 1 { LtarVersion::V2 } else { LtarVersion::V3 }, b)
     }
   };
   tarfile.write_all(match version {
     LtarVersion::V1 => b"LTAR",
     LtarVersion::V2 => b"LTR2",
+    LtarVersion::V3 => b"LTR3",
   })?;
   tarfile.write_u64::<LE>(trace.dep_hash.0)?;
   tarfile.write_all(trace_path.as_bytes())?;
   tarfile.write_u8(0)?;
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
-  if let LtarVersion::V2 = version {
+  if version >= LtarVersion::V2 {
     if trace.log.is_empty() {
       tarfile.write_u8(COMPRESSION_HASH_JSON)?;
       tarfile.write_u64::<LE>(trace.dep_hash.0)?;
@@ -297,7 +314,7 @@ pub fn pack(
     }
   }
   let mut it = args.into_iter();
-  while let Some(file) = it.next() {
+  while let Some(mut file) = it.next() {
     if file == "-c" {
       let comment = it.next().expect("expected comment argument");
       tarfile.write_u8(0)?;
@@ -305,9 +322,19 @@ pub fn pack(
       tarfile.write_u8(0)?;
       continue
     }
+    let mut idx = 0u8;
+    if file == "-i" {
+      idx = it.next().expect("expected index argument").parse().expect("expected number");
+      file = it.next().expect("expected file");
+    }
+    if version >= LtarVersion::V3 {
+      tarfile.write_u8(idx)?;
+    } else {
+      assert!(idx == 0);
+    }
     tarfile.write_all(file.as_bytes())?;
     tarfile.write_u8(0)?;
-    let path = basedir.join(file);
+    let path = basedirs.get(idx as usize).expect("not enough parent paths").join(file);
     if verbose {
       println!("compressing {}", path.display());
     }
