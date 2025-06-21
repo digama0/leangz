@@ -2,6 +2,7 @@ use leangz::ltar;
 use leangz::ltar::UnpackError;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
@@ -54,7 +55,7 @@ fn main() {
   let mut from_stdin = false;
   let mut json_stdin = true;
   let mut delete_corrupted = true;
-  let mut basedir = None;
+  let mut basedirs = vec![];
   let mut args = std::env::args();
   args.next();
   let mut args = args.peekable();
@@ -99,10 +100,8 @@ fn main() {
       }
       "-C" => {
         args.next();
-        if basedir.replace(args.next().unwrap_or_else(|| help_err("-C missing argument"))).is_some()
-        {
-          help_err("duplicate -C argument");
-        }
+        basedirs
+          .push(PathBuf::from(args.next().unwrap_or_else(|| help_err("-C missing argument"))));
       }
       "-k" => {
         do_show_comments = true;
@@ -111,7 +110,9 @@ fn main() {
       _ => break,
     }
   }
-  let basedir = PathBuf::from(basedir.unwrap_or_else(|| ".".into()));
+  if basedirs.is_empty() {
+    basedirs.push(".".into())
+  }
   if do_show_comments {
     let file = args.next().unwrap_or_else(|| help_err("expected FILE.ltar"));
     let tarfile = match File::open(&file) {
@@ -141,31 +142,53 @@ fn main() {
           let str = std::io::read_to_string(std::io::stdin()).unwrap();
           for j in serde_json::from_str::<Vec<serde_json::Value>>(&str).unwrap() {
             args_vec.push(if let serde_json::Value::String(s) = j {
-              (None, s)
+              (vec![], s)
             } else {
               let j = j.as_object().expect("expected object");
               let file = j["file"].as_str().expect("expected string");
-              let base = j.get("base").map(|b| b.as_str().expect("expected string").into());
+              let base = match j.get("base") {
+                None => vec![],
+                Some(b) => match b.as_array() {
+                  Some(arr) => arr
+                    .iter()
+                    .map(|v| {
+                      if v.is_null() {
+                        None::<PathBuf>
+                      } else {
+                        Some(v.as_str().expect("expected string or null").into())
+                      }
+                    })
+                    .collect(),
+                  None => vec![Some(b.as_str().expect("expected string or array").into())],
+                },
+              };
               (base, file.into())
             })
           }
         } else {
           for arg in std::io::stdin().lines().map(|arg| arg.unwrap()) {
-            args_vec.push((None, arg))
+            args_vec.push((vec![], arg))
           }
         }
       } else {
-        args_vec.push((None, arg))
+        args_vec.push((vec![], arg))
       }
     }
 
     let mut error = AtomicBool::new(false);
     let fail = || error.store(true, std::sync::atomic::Ordering::Relaxed);
-    args_vec.into_par_iter().for_each(|(basedir2, file)| {
+    args_vec.into_par_iter().for_each(|(basedirs2, file)| {
       if verbose {
         println!("unpacking {file}");
       }
-      let basedir = basedir2.as_ref().unwrap_or(&basedir);
+      let mut basedirs = Cow::Borrowed(&basedirs);
+      for (i, basedir2) in basedirs2.iter().enumerate() {
+        if let Some(basedir2) = basedir2 {
+          if let Some(b) = basedirs.to_mut().get_mut(i) {
+            b.clone_from(basedir2)
+          }
+        }
+      }
       let tarfile = match File::open(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
           eprintln!("{file} not found");
@@ -173,7 +196,7 @@ fn main() {
         }
         e => BufReader::new(e.unwrap()),
       };
-      if let Err(e) = ltar::unpack(basedir, tarfile, force, verbose) {
+      if let Err(e) = ltar::unpack(&basedirs, tarfile, force, verbose) {
         if matches!(&e, UnpackError::IOError(e)
           if matches!(e.kind(), io::ErrorKind::UnexpectedEof))
         {
@@ -195,6 +218,6 @@ fn main() {
     let tarfile = args.next().unwrap_or_else(|| help_err("expected OUT.ltar"));
     let trace_path = args.next().unwrap_or_else(|| help_err("expected FILE.trace"));
     let tarfile = BufWriter::new(File::create(tarfile).unwrap());
-    ltar::pack(&basedir, tarfile, &trace_path, args, verbose).unwrap()
+    ltar::pack(&basedirs, tarfile, &trace_path, args, verbose).unwrap()
   }
 }
