@@ -81,11 +81,24 @@ struct Message {
   level: Level,
 }
 
+const fn true_fn() -> bool { true }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildTraceV2 {
+  #[serde(skip_serializing_if = "Vec::is_empty")]
   log: Vec<Message>,
   dep_hash: Hash,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  outputs: Option<serde_json::Value>,
+  #[allow(dead_code)]
+  #[serde(skip_serializing, default = "true_fn")]
+  synthetic: bool,
+}
+
+impl BuildTraceV2 {
+  fn from_hash(hash: u64) -> Self {
+    Self { log: vec![], dep_hash: Hash(hash), outputs: None, synthetic: true }
+  }
 }
 
 enum BuildTrace {
@@ -285,7 +298,7 @@ fn unpack_one<R: BufRead>(
       rollback.push(path);
     }
     COMPRESSION_HASH_JSON => {
-      let b = BuildTraceV2 { log: vec![], dep_hash: Hash(tarfile.read_u64::<LE>()?) };
+      let b = BuildTraceV2::from_hash(tarfile.read_u64::<LE>()?);
       std::fs::write(&path, serde_json::to_vec(&b).unwrap())?;
       rollback.push(path);
     }
@@ -321,7 +334,7 @@ pub fn pack(
   let (version, trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
     BuildTrace::Missing => panic!("expected .trace file"),
     BuildTrace::Bad => panic!("bad .trace file"),
-    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV2 { log: vec![], dep_hash: Hash(n) }),
+    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV2::from_hash(n)),
     BuildTrace::V2(mut b) => {
       b.log.retain(|it| it.level >= Level::Info);
       (if basedirs.len() == 1 { LtarVersion::V2 } else { LtarVersion::V3 }, b)
@@ -338,7 +351,7 @@ pub fn pack(
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
   if version >= LtarVersion::V2 {
-    if trace.log.is_empty() {
+    if trace.log.is_empty() && trace.outputs.is_none() {
       tarfile.write_u8(COMPRESSION_HASH_JSON)?;
       tarfile.write_u64::<LE>(trace.dep_hash.0)?;
     } else {
