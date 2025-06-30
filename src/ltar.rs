@@ -1,6 +1,7 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ const COMPRESSION_ZSTD: u8 = 0;
 const COMPRESSION_LGZ: u8 = 1;
 const COMPRESSION_HASH_PLAIN: u8 = 2;
 const COMPRESSION_HASH_JSON: u8 = 3;
+const COMPRESSION_HASH_OUTPUT: u8 = 4;
 
 pub enum UnpackError {
   IOError(io::Error),
@@ -51,12 +53,13 @@ enum LtarVersion {
   V3,
 }
 
-impl TryFrom<&str> for Hash {
+impl TryFrom<Cow<'_, str>> for Hash {
   type Error = std::num::ParseIntError;
-  fn try_from(value: &str) -> Result<Self, Self::Error> { value.parse().map(Hash) }
+  fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> { value.parse().map(Hash) }
 }
+
 #[derive(Deserialize)]
-#[serde(try_from = "&str")]
+#[serde(try_from = "Cow<'_, str>")]
 struct Hash(u64);
 impl Serialize for Hash {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
@@ -64,7 +67,6 @@ impl Serialize for Hash {
     ser.serialize_str(&self.0.to_string())
   }
 }
-
 #[derive(Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum Level {
@@ -81,6 +83,78 @@ struct Message {
   level: Level,
 }
 
+#[derive(Serialize)]
+struct ModuleOutputHashes {
+  #[serde(rename = "o")]
+  olean: Vec<Hash>,
+  #[serde(rename = "i")]
+  ilean: Hash,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  ir: Option<Hash>,
+  c: Hash,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  bc: Option<Hash>,
+}
+
+const OUTPUT_HASH_END: u8 = 0;
+const OUTPUT_HASH_OLEAN: u8 = 1;
+const OUTPUT_HASH_IR: u8 = 4;
+const OUTPUT_HASH_BC: u8 = 5;
+
+fn assert_none<T, E>(i: Option<T>, e: E) -> Result<(), E> {
+  match i {
+    Some(_) => Err(e),
+    None => Ok(()),
+  }
+}
+
+impl TryFrom<&serde_json::Value> for ModuleOutputHashes {
+  type Error = ();
+  fn try_from(value: &serde_json::Value) -> Result<Self, Self::Error> {
+    let (mut o, mut ilean, mut ir, mut c, mut bc) = (None, None, None, None, None);
+    for (key, val) in value.as_object().ok_or(())? {
+      match &**key {
+        "o" => assert_none(o.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
+        "i" =>
+          assert_none(ilean.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
+        "ir" => assert_none(ir.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
+        "c" => assert_none(c.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
+        "b" => assert_none(bc.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
+        _ => return Err(()),
+      }
+    }
+    let olean: Vec<Hash> = o.ok_or(())?;
+    if olean.is_empty() {
+      return Err(())
+    }
+    Ok(Self { olean, ilean: ilean.ok_or(())?, ir, c: c.ok_or(())?, bc })
+  }
+}
+
+enum Outputs {
+  LeanModule(ModuleOutputHashes),
+  Other(serde_json::Value),
+}
+impl Serialize for Outputs {
+  fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+  where S: serde::Serializer {
+    match self {
+      Outputs::LeanModule(m) => m.serialize(ser),
+      Outputs::Other(value) => value.serialize(ser),
+    }
+  }
+}
+impl<'de> Deserialize<'de> for Outputs {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where D: serde::Deserializer<'de> {
+    let val: serde_json::Value = Deserialize::deserialize(deserializer)?;
+    match (&val).try_into() {
+      Ok(m) => Ok(Outputs::LeanModule(m)),
+      Err(_) => Ok(Outputs::Other(val)),
+    }
+  }
+}
+
 const fn true_fn() -> bool { true }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,15 +163,15 @@ struct BuildTraceV2 {
   log: Vec<Message>,
   dep_hash: Hash,
   #[serde(skip_serializing_if = "Option::is_none")]
-  outputs: Option<serde_json::Value>,
+  outputs: Option<Outputs>,
   #[allow(dead_code)]
   #[serde(skip_serializing, default = "true_fn")]
   synthetic: bool,
 }
 
 impl BuildTraceV2 {
-  fn from_hash(hash: u64) -> Self {
-    Self { log: vec![], dep_hash: Hash(hash), outputs: None, synthetic: true }
+  fn from_hash(hash: u64, outputs: Option<Outputs>) -> Self {
+    Self { log: vec![], dep_hash: Hash(hash), outputs, synthetic: true }
   }
 }
 
@@ -298,7 +372,31 @@ fn unpack_one<R: BufRead>(
       rollback.push(path);
     }
     COMPRESSION_HASH_JSON => {
-      let b = BuildTraceV2::from_hash(tarfile.read_u64::<LE>()?);
+      let b = BuildTraceV2::from_hash(tarfile.read_u64::<LE>()?, None);
+      std::fs::write(&path, serde_json::to_vec(&b).unwrap())?;
+      rollback.push(path);
+    }
+    COMPRESSION_HASH_OUTPUT => {
+      let hash = tarfile.read_u64::<LE>()?;
+      let mut m = ModuleOutputHashes {
+        olean: vec![Hash(tarfile.read_u64::<LE>()?)],
+        ilean: Hash(tarfile.read_u64::<LE>()?),
+        ir: None,
+        c: Hash(tarfile.read_u64::<LE>()?),
+        bc: None,
+      };
+      loop {
+        match tarfile.read_u8()? {
+          OUTPUT_HASH_END => break,
+          OUTPUT_HASH_OLEAN => m.olean.push(Hash(tarfile.read_u64::<LE>()?)),
+          OUTPUT_HASH_IR =>
+            assert_none(m.ir.replace(Hash(tarfile.read_u64::<LE>()?)), UnpackError::BadLtar)?,
+          OUTPUT_HASH_BC =>
+            assert_none(m.bc.replace(Hash(tarfile.read_u64::<LE>()?)), UnpackError::BadLtar)?,
+          _ => return Err(UnpackError::BadLtar),
+        }
+      }
+      let b = BuildTraceV2::from_hash(hash, Some(Outputs::LeanModule(m)));
       std::fs::write(&path, serde_json::to_vec(&b).unwrap())?;
       rollback.push(path);
     }
@@ -334,7 +432,7 @@ pub fn pack(
   let (version, trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
     BuildTrace::Missing => panic!("expected .trace file"),
     BuildTrace::Bad => panic!("bad .trace file"),
-    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV2::from_hash(n)),
+    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV2::from_hash(n, None)),
     BuildTrace::V2(mut b) => {
       b.log.retain(|it| it.level >= Level::Info);
       (if basedirs.len() == 1 { LtarVersion::V2 } else { LtarVersion::V3 }, b)
@@ -351,12 +449,36 @@ pub fn pack(
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
   if version >= LtarVersion::V2 {
-    if trace.log.is_empty() && trace.outputs.is_none() {
-      tarfile.write_u8(COMPRESSION_HASH_JSON)?;
-      tarfile.write_u64::<LE>(trace.dep_hash.0)?;
-    } else {
-      pack_zstd(&serde_json::to_vec(&trace)?, &mut tarfile)?;
-    }
+    match trace {
+      BuildTraceV2 { log, dep_hash, outputs: None, synthetic: _ } if log.is_empty() => {
+        tarfile.write_u8(COMPRESSION_HASH_JSON)?;
+        tarfile.write_u64::<LE>(dep_hash.0)?;
+      }
+      BuildTraceV2 { log, dep_hash, outputs: Some(Outputs::LeanModule(m)), synthetic: _ }
+        if log.is_empty() =>
+      {
+        tarfile.write_u8(COMPRESSION_HASH_OUTPUT)?;
+        tarfile.write_u64::<LE>(dep_hash.0)?;
+        let mut oleans = m.olean.iter();
+        tarfile.write_u64::<LE>(oleans.next().unwrap().0)?;
+        tarfile.write_u64::<LE>(m.ilean.0)?;
+        tarfile.write_u64::<LE>(m.c.0)?;
+        for olean in oleans {
+          tarfile.write_u8(OUTPUT_HASH_OLEAN)?;
+          tarfile.write_u64::<LE>(olean.0)?;
+        }
+        if let Some(ir) = &m.ir {
+          tarfile.write_u8(OUTPUT_HASH_IR)?;
+          tarfile.write_u64::<LE>(ir.0)?;
+        }
+        if let Some(bc) = &m.bc {
+          tarfile.write_u8(OUTPUT_HASH_BC)?;
+          tarfile.write_u64::<LE>(bc.0)?;
+        }
+        tarfile.write_u8(OUTPUT_HASH_END)?;
+      }
+      _ => pack_zstd(&serde_json::to_vec(&trace)?, &mut tarfile)?,
+    };
   }
   let mut it = args.into_iter();
   while let Some(mut file) = it.next() {
@@ -447,6 +569,16 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
     let len = match tarfile.read_u8()? {
       COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
       COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
+      COMPRESSION_HASH_OUTPUT => {
+        tarfile.seek(io::SeekFrom::Current(32))?;
+        loop {
+          match tarfile.read_u8()? {
+            OUTPUT_HASH_END => return Ok(()),
+            OUTPUT_HASH_OLEAN | OUTPUT_HASH_IR | OUTPUT_HASH_BC => tarfile.read_u64::<LE>()?,
+            _ => return Err(UnpackError::BadLtar),
+          };
+        }
+      }
       compression => return Err(UnpackError::UnsupportedCompression(compression)),
     };
     tarfile.seek(io::SeekFrom::Current(len as _))?;
