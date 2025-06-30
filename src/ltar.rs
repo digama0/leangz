@@ -143,29 +143,31 @@ pub fn unpack<R: BufRead + Seek>(
       tarfile.read_until(0, buf)?;
       Ok(buf.pop().is_some())
     };
-    let read_cstr_path =
-      |buf: &mut Vec<_>, tarfile: &mut R| -> Result<Option<Option<PathBuf>>, UnpackError> {
-        let pathidx = if version < LtarVersion::V3 {
-          0
-        } else {
-          match tarfile.read_u8() {
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-            idx => idx?,
-          }
-        };
-        Ok(match read_cstr(buf, tarfile)? {
-          true if buf.is_empty() => Some(None),
-          true => Some(Some(
-            basedir
-              .get(pathidx as usize)
-              .ok_or(UnpackError::NotEnoughPaths(pathidx))?
-              .join(std::str::from_utf8(buf)?),
-          )),
-          false => None,
-        })
+    let read_cstr_path = |pathidx: bool,
+                          buf: &mut Vec<_>,
+                          tarfile: &mut R|
+     -> Result<Option<Option<PathBuf>>, UnpackError> {
+      let pathidx = if !pathidx || version < LtarVersion::V3 {
+        0
+      } else {
+        match tarfile.read_u8() {
+          Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+          idx => idx?,
+        }
       };
+      Ok(match read_cstr(buf, tarfile)? {
+        true if buf.is_empty() => Some(None),
+        true => Some(Some(
+          basedir
+            .get(pathidx as usize)
+            .ok_or(UnpackError::NotEnoughPaths(pathidx))?
+            .join(std::str::from_utf8(buf)?),
+        )),
+        false => None,
+      })
+    };
     let trace_path =
-      read_cstr_path(&mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
+      read_cstr_path(false, &mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
     let mut skip = false;
     if !force {
       let b = read_trace_file(&trace_path)?;
@@ -211,7 +213,7 @@ pub fn unpack<R: BufRead + Seek>(
         )?
       }
     }
-    while let Some(path) = read_cstr_path(&mut buf, &mut tarfile)? {
+    while let Some(path) = read_cstr_path(true, &mut buf, &mut tarfile)? {
       if let Some(path) = path {
         if skip && matches!(std::fs::exists(&path), Ok(true)) {
           skip_one(&mut tarfile, verbose, path)?
@@ -425,7 +427,10 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
     tarfile.read_until(0, buf)?;
     Ok(buf.pop().is_some())
   };
-  fn skip_one<R: BufRead + Seek>(tarfile: &mut R) -> Result<(), UnpackError> {
+  fn skip_one<R: BufRead + Seek>(pathidx: bool, tarfile: &mut R) -> Result<(), UnpackError> {
+    if pathidx {
+      tarfile.read_u8()?;
+    }
     let len = match tarfile.read_u8()? {
       COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
       COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
@@ -437,8 +442,8 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
   if !read_cstr(&mut buf, &mut tarfile)? {
     return Err(UnpackError::BadLtar)
   }
-  if let LtarVersion::V2 = version {
-    skip_one(&mut tarfile)?
+  if version >= LtarVersion::V2 {
+    skip_one(false, &mut tarfile)?
   }
   let mut comments = vec![];
   while read_cstr(&mut buf, &mut tarfile)? {
@@ -449,7 +454,7 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
       comments.push(std::str::from_utf8(&buf)?.to_string());
       continue
     }
-    skip_one(&mut tarfile)?;
+    skip_one(version >= LtarVersion::V3, &mut tarfile)?;
   }
   Ok(comments)
 }
