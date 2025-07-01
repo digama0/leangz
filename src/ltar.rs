@@ -89,8 +89,8 @@ struct ModuleOutputHashes {
   olean: Vec<Hash>,
   #[serde(rename = "i")]
   ilean: Hash,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  ir: Option<Hash>,
+  // #[serde(skip_serializing_if = "Option::is_none")]
+  // ir: Option<Hash>,
   c: Hash,
   #[serde(rename = "b", skip_serializing_if = "Option::is_none")]
   bc: Option<Hash>,
@@ -98,8 +98,8 @@ struct ModuleOutputHashes {
 
 const OUTPUT_HASH_END: u8 = 0;
 const OUTPUT_HASH_OLEAN: u8 = 1;
-const OUTPUT_HASH_IR: u8 = 4;
-const OUTPUT_HASH_BC: u8 = 5;
+const OUTPUT_HASH_BC: u8 = 2;
+// const OUTPUT_HASH_IR: u8 = 3;
 
 fn assert_none<T, E>(i: Option<T>, e: E) -> Result<(), E> {
   match i {
@@ -111,23 +111,23 @@ fn assert_none<T, E>(i: Option<T>, e: E) -> Result<(), E> {
 impl TryFrom<&serde_json::Value> for ModuleOutputHashes {
   type Error = ();
   fn try_from(value: &serde_json::Value) -> Result<Self, Self::Error> {
-    let (mut o, mut ilean, mut ir, mut c, mut bc) = (None, None, None, None, None);
+    let (mut o, mut ilean, mut c, mut bc) = (None, None, None, None);
     for (key, val) in value.as_object().ok_or(())? {
       match &**key {
         "o" => assert_none(o.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         "i" =>
           assert_none(ilean.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
-        "ir" => assert_none(ir.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
+        // "ir" => assert_none(ir.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         "c" => assert_none(c.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         "b" => assert_none(bc.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         _ => return Err(()),
       }
     }
     let olean: Vec<Hash> = o.ok_or(())?;
-    if olean.is_empty() {
+    if olean.len() != 1 {
       return Err(())
     }
-    Ok(Self { olean, ilean: ilean.ok_or(())?, ir, c: c.ok_or(())?, bc })
+    Ok(Self { olean, ilean: ilean.ok_or(())?, c: c.ok_or(())?, bc })
   }
 }
 
@@ -381,7 +381,7 @@ fn unpack_one<R: BufRead>(
       let mut m = ModuleOutputHashes {
         olean: vec![Hash(tarfile.read_u64::<LE>()?)],
         ilean: Hash(tarfile.read_u64::<LE>()?),
-        ir: None,
+        // ir: None,
         c: Hash(tarfile.read_u64::<LE>()?),
         bc: None,
       };
@@ -389,8 +389,8 @@ fn unpack_one<R: BufRead>(
         match tarfile.read_u8()? {
           OUTPUT_HASH_END => break,
           OUTPUT_HASH_OLEAN => m.olean.push(Hash(tarfile.read_u64::<LE>()?)),
-          OUTPUT_HASH_IR =>
-            assert_none(m.ir.replace(Hash(tarfile.read_u64::<LE>()?)), UnpackError::BadLtar)?,
+          // OUTPUT_HASH_IR =>
+          //   assert_none(m.ir.replace(Hash(tarfile.read_u64::<LE>()?)), UnpackError::BadLtar)?,
           OUTPUT_HASH_BC =>
             assert_none(m.bc.replace(Hash(tarfile.read_u64::<LE>()?)), UnpackError::BadLtar)?,
           _ => return Err(UnpackError::BadLtar),
@@ -467,10 +467,10 @@ pub fn pack(
           tarfile.write_u8(OUTPUT_HASH_OLEAN)?;
           tarfile.write_u64::<LE>(olean.0)?;
         }
-        if let Some(ir) = &m.ir {
-          tarfile.write_u8(OUTPUT_HASH_IR)?;
-          tarfile.write_u64::<LE>(ir.0)?;
-        }
+        // if let Some(ir) = &m.ir {
+        //   tarfile.write_u8(OUTPUT_HASH_IR)?;
+        //   tarfile.write_u64::<LE>(ir.0)?;
+        // }
         if let Some(bc) = &m.bc {
           tarfile.write_u8(OUTPUT_HASH_BC)?;
           tarfile.write_u64::<LE>(bc.0)?;
@@ -574,7 +574,8 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
         loop {
           match tarfile.read_u8()? {
             OUTPUT_HASH_END => return Ok(()),
-            OUTPUT_HASH_OLEAN | OUTPUT_HASH_IR | OUTPUT_HASH_BC => tarfile.read_u64::<LE>()?,
+            OUTPUT_HASH_OLEAN // | OUTPUT_HASH_IR
+            | OUTPUT_HASH_BC => tarfile.read_u64::<LE>()?,
             _ => return Err(UnpackError::BadLtar),
           };
         }
