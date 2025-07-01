@@ -92,7 +92,7 @@ struct ModuleOutputHashes {
   #[serde(skip_serializing_if = "Option::is_none")]
   ir: Option<Hash>,
   c: Hash,
-  #[serde(skip_serializing_if = "Option::is_none")]
+  #[serde(rename = "b", skip_serializing_if = "Option::is_none")]
   bc: Option<Hash>,
 }
 
