@@ -282,7 +282,7 @@ pub fn unpack<R: BufRead + Seek>(
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
     if skip && matches!(std::fs::exists(&trace_path), Ok(true)) {
-      skip_one(&mut tarfile, verbose, trace_path)?
+      skip_one(&mut tarfile, verbose, Some(trace_path))?
     } else {
       cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
       if version < LtarVersion::V2 {
@@ -303,7 +303,7 @@ pub fn unpack<R: BufRead + Seek>(
     while let Some(path) = read_cstr_path(true, &mut buf, &mut tarfile)? {
       if let Some(path) = path {
         if skip && matches!(std::fs::exists(&path), Ok(true)) {
-          skip_one(&mut tarfile, verbose, path)?
+          skip_one(&mut tarfile, verbose, Some(path))?
         } else {
           cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
           unpack_one(
@@ -406,22 +406,31 @@ fn unpack_one<R: BufRead>(
 }
 
 fn skip_one<R: BufRead + Seek>(
-  tarfile: &mut R, verbose: bool, path: PathBuf,
+  tarfile: &mut R, verbose: bool, path: Option<PathBuf>,
 ) -> Result<(), UnpackError> {
   let compression = tarfile.read_u8()?;
   if verbose {
-    println!("skipping {}, compression = {compression}", path.display());
-  }
-  match compression {
-    COMPRESSION_ZSTD | COMPRESSION_LGZ => {
-      let len = tarfile.read_u64::<LE>()?;
-      tarfile.seek_relative(len.try_into().unwrap())?;
+    if let Some(path) = path {
+      println!("skipping {}, compression = {compression}", path.display());
     }
-    COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => {
-      tarfile.read_u64::<LE>()?;
+  }
+  let len = match compression {
+    COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
+    COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
+    COMPRESSION_HASH_OUTPUT => {
+      tarfile.seek(io::SeekFrom::Current(32))?;
+      loop {
+        match tarfile.read_u8()? {
+          OUTPUT_HASH_END => return Ok(()),
+          OUTPUT_HASH_OLEAN // | OUTPUT_HASH_IR
+          | OUTPUT_HASH_BC => tarfile.read_u64::<LE>()?,
+          _ => return Err(UnpackError::BadLtar),
+        };
+      }
     }
     compression => return Err(UnpackError::UnsupportedCompression(compression)),
-  }
+  };
+  tarfile.seek_relative(len.try_into().unwrap())?;
   Ok(())
 }
 
@@ -484,6 +493,9 @@ pub fn pack(
   while let Some(mut file) = it.next() {
     if file == "-c" {
       let comment = it.next().expect("expected comment argument");
+      if version >= LtarVersion::V3 {
+        tarfile.write_u8(0)?;
+      }
       tarfile.write_u8(0)?;
       tarfile.write_all(comment.as_bytes())?;
       tarfile.write_u8(0)?;
@@ -557,50 +569,33 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
   let version = get_version(&mut tarfile)?;
   let mut buf = vec![];
   tarfile.read_u64::<LE>()?;
-  let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
+  let read_cstr = |pathidx: bool, buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
+    if pathidx {
+      match tarfile.read_u8() {
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(false),
+        idx => idx?,
+      };
+    }
     buf.clear();
     tarfile.read_until(0, buf)?;
     Ok(buf.pop().is_some())
   };
-  fn skip_one<R: BufRead + Seek>(pathidx: bool, tarfile: &mut R) -> Result<(), UnpackError> {
-    if pathidx {
-      tarfile.read_u8()?;
-    }
-    let len = match tarfile.read_u8()? {
-      COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
-      COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
-      COMPRESSION_HASH_OUTPUT => {
-        tarfile.seek(io::SeekFrom::Current(32))?;
-        loop {
-          match tarfile.read_u8()? {
-            OUTPUT_HASH_END => return Ok(()),
-            OUTPUT_HASH_OLEAN // | OUTPUT_HASH_IR
-            | OUTPUT_HASH_BC => tarfile.read_u64::<LE>()?,
-            _ => return Err(UnpackError::BadLtar),
-          };
-        }
-      }
-      compression => return Err(UnpackError::UnsupportedCompression(compression)),
-    };
-    tarfile.seek(io::SeekFrom::Current(len as _))?;
-    Ok(())
-  }
-  if !read_cstr(&mut buf, &mut tarfile)? {
+  if !read_cstr(false, &mut buf, &mut tarfile)? {
     return Err(UnpackError::BadLtar)
   }
   if version >= LtarVersion::V2 {
-    skip_one(false, &mut tarfile)?
+    skip_one(&mut tarfile, false, None)?
   }
   let mut comments = vec![];
-  while read_cstr(&mut buf, &mut tarfile)? {
+  while read_cstr(version >= LtarVersion::V3, &mut buf, &mut tarfile)? {
     if buf.is_empty() {
-      if !read_cstr(&mut buf, &mut tarfile)? {
+      if !read_cstr(false, &mut buf, &mut tarfile)? {
         return Err(UnpackError::BadLtar)
       }
       comments.push(std::str::from_utf8(&buf)?.to_string());
-      continue
+    } else {
+      skip_one(&mut tarfile, false, None)?;
     }
-    skip_one(version >= LtarVersion::V3, &mut tarfile)?;
   }
   Ok(comments)
 }
