@@ -184,8 +184,12 @@ fn main() {
       let mut basedirs = Cow::Borrowed(&basedirs);
       for (i, basedir2) in basedirs2.iter().enumerate() {
         if let Some(basedir2) = basedir2 {
-          if let Some(b) = basedirs.to_mut().get_mut(i) {
+          let basedirs = basedirs.to_mut();
+          if let Some(b) = basedirs.get_mut(i) {
             b.clone_from(basedir2)
+          } else {
+            assert_eq!(i, basedirs.len(), "{file}: missing basedir {}", basedirs.len());
+            basedirs.push(basedir2.clone())
           }
         }
       }
