@@ -220,7 +220,7 @@ const fn true_fn() -> bool { true }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildTraceV3 {
-  version: TraceVersion,
+  schema_version: TraceVersion,
   #[serde(skip_serializing_if = "Vec::is_empty")]
   log: Vec<Message>,
   dep_hash: Hash,
@@ -233,7 +233,13 @@ struct BuildTraceV3 {
 
 impl BuildTraceV3 {
   fn from_hash(hash: u64, outputs: Option<Outputs>) -> Self {
-    Self { version: TraceVersion::V3, log: vec![], dep_hash: Hash(hash), outputs, synthetic: true }
+    Self {
+      schema_version: TraceVersion::V3,
+      log: vec![],
+      dep_hash: Hash(hash),
+      outputs,
+      synthetic: true,
+    }
   }
   fn is_simple(&self) -> bool {
     if !self.log.is_empty() {
