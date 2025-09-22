@@ -55,7 +55,9 @@ enum LtarVersion {
 
 impl TryFrom<Cow<'_, str>> for Hash {
   type Error = std::num::ParseIntError;
-  fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> { value.parse().map(Hash) }
+  fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> {
+    u64::from_str_radix(&value, 16).map(Hash)
+  }
 }
 
 #[derive(Deserialize)]
@@ -64,7 +66,7 @@ struct Hash(u64);
 impl Serialize for Hash {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
   where S: serde::Serializer {
-    ser.serialize_str(&self.0.to_string())
+    ser.serialize_str(&format!("{:016x}", self.0))
   }
 }
 #[derive(Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq)]
