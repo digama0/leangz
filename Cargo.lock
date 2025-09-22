@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "leangz"
-version = "0.1.16-pre"
+version = "0.1.16-pre2"
 dependencies = [
  "byteorder",
  "flate2",
