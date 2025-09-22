@@ -85,10 +85,27 @@ struct Message {
   level: Level,
 }
 
-#[derive(Serialize, Deserialize)]
 struct Descr {
   hash: Hash,
   ext: Cow<'static, str>,
+}
+impl Serialize for Descr {
+  fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+  where S: serde::Serializer {
+    ser.serialize_str(&format!("{:016x}.{}", self.hash.0, self.ext))
+  }
+}
+impl<'de> Deserialize<'de> for Descr {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where D: serde::Deserializer<'de> {
+    let s = <&str>::deserialize(deserializer)?;
+    let bad = || serde::de::Error::custom("bad value");
+    if s.as_bytes().get(16) != Some(&b'.') {
+      return Err(bad())
+    }
+    let hash = Hash(u64::from_str_radix(&s[..16], 16).map_err(|_| bad())?);
+    Ok(Descr { hash, ext: s[17..].to_owned().into() })
+  }
 }
 
 impl Descr {
