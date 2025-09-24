@@ -226,7 +226,7 @@ impl Serialize for TraceVersion {
 impl<'de> Deserialize<'de> for TraceVersion {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where D: serde::Deserializer<'de> {
-    match <&str>::deserialize(deserializer)? {
+    match &*<Cow<'_, str>>::deserialize(deserializer)? {
       "2025-09-10" => Ok(TraceVersion::V3),
       _ => Err(serde::de::Error::custom("unsupported version")),
     }
@@ -304,7 +304,7 @@ fn read_trace_file(trace_path: &Path) -> Result<BuildTrace, io::Error> {
     BuildTrace::V1(n)
   } else {
     let val: serde_json::Value = serde_json::de::from_str(&res)?;
-    match val.as_object().and_then(|o| o.get("version")) {
+    match val.as_object().and_then(|o| o.get("schemaVersion")) {
       Some(s) => match serde_json::from_value(s.clone()) {
         Ok(TraceVersion::V3) => match serde_json::from_value(val) {
           Ok(b) => BuildTrace::V3(b),
