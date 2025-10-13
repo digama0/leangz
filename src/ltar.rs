@@ -18,6 +18,7 @@ const COMPRESSION_LGZ: u8 = 1;
 const COMPRESSION_HASH_PLAIN: u8 = 2;
 const COMPRESSION_HASH_JSON: u8 = 3;
 const COMPRESSION_HASH_OUTPUT: u8 = 4;
+const COMPRESSION_LGZ_MULTI: u8 = 5;
 
 pub enum UnpackError {
   IOError(io::Error),
@@ -624,6 +625,11 @@ pub fn pack(
       tarfile.write_u8(0)?;
       continue
     }
+    let mut module = false;
+    if file == "-m" {
+      module = true;
+      file = it.next().expect("expected file");
+    }
     let mut idx = 0u8;
     if file == "-i" {
       idx = it.next().expect("expected index argument").parse().expect("expected number");
@@ -640,21 +646,30 @@ pub fn pack(
     if verbose {
       println!("compressing {}", path.display());
     }
-    let mmap = unsafe { Mmap::map(&File::open(path)?)? };
-    if mmap.get(..5) == Some(b"olean") {
+    let is_olean = path.extension().is_some_and(|x| x == "olean");
+    let mmap = unsafe { Mmap::map(&File::open(&path)?)? };
+    if is_olean && mmap.get(..5) == Some(b"olean") {
       let mut buf = vec![];
-      tarfile.write_u8(COMPRESSION_LGZ)?;
+      tarfile.write_u8(if module { COMPRESSION_LGZ_MULTI } else { COMPRESSION_LGZ })?;
+      let (server, private);
+      let mmaps: &[&[u8]] = if module {
+        server = unsafe { Mmap::map(&File::open(path.with_extension("olean.server"))?)? };
+        private = unsafe { Mmap::map(&File::open(path.with_extension("olean.private"))?)? };
+        &[&mmap, &server, &private]
+      } else {
+        &[&mmap]
+      };
       #[cfg(feature = "zstd")]
       {
         #[cfg(feature = "zstd-dict")]
         let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
         #[cfg(not(feature = "zstd-dict"))]
         let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
-        lgz::compress(&mmap, &mut enc);
+        lgz::compress(mmaps, &mut enc);
         enc.finish()?;
       }
       #[cfg(not(feature = "zstd"))]
-      lgz::compress(&mmap, &mut buf);
+      lgz::compress(mmaps, &mut buf);
       tarfile.write_u64::<LE>(buf.len() as u64)?;
       tarfile.write_all(&buf)?;
     } else if let Some(n) = (|| {

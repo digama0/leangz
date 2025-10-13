@@ -66,7 +66,7 @@ fn main() {
       println!("{file}");
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
       let mut lgzfile = vec![];
-      compressor.compress(&mmap, std::io::Cursor::new(&mut lgzfile));
+      compressor.compress(&[&mmap], std::io::Cursor::new(&mut lgzfile));
       let oleanfile = decompressor.decompress(std::io::Cursor::new(&lgzfile));
       assert!(*mmap == *oleanfile);
       lgzs += lgzfile.len();
@@ -122,7 +122,7 @@ fn main() {
       for file in args {
         let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
         let mut w = leangz::lgz::WithPosition { r: std::io::sink(), pos: 0 };
-        compressor.compress(&mmap, &mut w);
+        compressor.compress(&[&mmap], &mut w);
         oleans += mmap.len();
         lgzs += w.pos;
       }
@@ -145,7 +145,7 @@ fn main() {
       oleans += mmap.len();
       let outfile = BufWriter::new(File::create(outfile).unwrap());
       let mut w = leangz::lgz::WithPosition { r: outfile, pos: 0 };
-      compressor.compress(&mmap, &mut w);
+      compressor.compress(&[&mmap], &mut w);
       lgzs += w.pos;
     }
     println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
@@ -171,7 +171,7 @@ impl Compressor {
     }
   }
 
-  fn compress(&self, olean: &[u8], outfile: impl Write) {
+  fn compress(&self, oleans: &[&[u8]], outfile: impl Write) {
     #[cfg(feature = "flate2")]
     let outfile = flate2::write::GzEncoder::new(outfile, flate2::Compression::new(7));
     #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
@@ -179,7 +179,7 @@ impl Compressor {
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let outfile = zstd::stream::Encoder::with_prepared_dictionary(outfile, &self.dict).unwrap();
     let mut outfile = outfile;
-    leangz::lgz::compress(olean, &mut outfile);
+    leangz::lgz::compress(oleans, &mut outfile);
     #[cfg(any(feature = "flate2", feature = "zstd"))]
     outfile.finish().unwrap();
     #[cfg(not(any(feature = "flate2", feature = "zstd")))]

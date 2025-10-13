@@ -36,6 +36,7 @@ fn use_gmp(mac_v2: bool) -> bool {
   }
 }
 
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
 enum OLeanVersion {
   V0,
   V1,
@@ -50,7 +51,7 @@ struct HeaderV0 {
   root: U64<ZLE>,
 }
 
-#[derive(PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, PartialOrd, Ord, PartialEq, Eq)]
 struct RegularLeanVersion {
   major: u8,
   minor: u8,
@@ -61,6 +62,7 @@ struct RegularLeanVersion {
   rc_m1: u8,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum LeanVersion {
   Regular(RegularLeanVersion),
   Unknown([u8; 33]),
@@ -99,21 +101,30 @@ impl LeanVersion {
     }
   }
 }
-struct Header {
+#[derive(Debug, PartialEq, Eq)]
+struct VHeader {
   lean_version: LeanVersion,
   githash: [u8; 40],
-  base: u64,
-  root: u64,
 }
 
-fn parse_as_v0(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
+#[derive(Debug, PartialEq, Eq)]
+struct Header {
+  cfg: Config,
+  vheader: VHeader,
+  base: u64,
+  root: u64,
+  offset: u64,
+}
+
+fn parse_as_v0(olean: &[u8]) -> (Header, &[u8]) {
   let (header, rest) = Ref::<_, HeaderV0>::from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
   let cfg = Config { use_gmp: use_gmp(false) };
   let lean_version = LeanVersion::UNKNOWN;
-  (cfg, Header { base, lean_version, githash: [0; 40], root: header.root.get() }, offset, rest)
+  let vheader = VHeader { lean_version, githash: [0; 40] };
+  (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
 }
 
 #[repr(C, align(8))]
@@ -156,7 +167,7 @@ fn mac_v1_use_gmp(githash: &[u8; 40]) -> bool {
   }
 }
 
-fn parse_as_v1(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
+fn parse_as_v1(olean: &[u8]) -> (Header, &[u8]) {
   let (header, rest) = Ref::<_, HeaderV1>::from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"olean");
   assert_eq!(header.version, 1);
@@ -167,7 +178,8 @@ fn parse_as_v1(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
   githash.copy_from_slice(&header.githash);
   let cfg = Config { use_gmp: use_gmp(mac_v1_use_gmp(&header.githash)) };
   let lean_version = LeanVersion::UNKNOWN;
-  (cfg, Header { base, lean_version, githash, root: header.root.get() }, offset, rest)
+  let vheader = VHeader { lean_version, githash };
+  (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
 }
 
 #[repr(C, align(8))]
@@ -182,7 +194,7 @@ struct HeaderV2 {
   root: U64<ZLE>,
 }
 
-fn parse_as_v2(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
+fn parse_as_v2(olean: &[u8]) -> (Header, &[u8]) {
   let (header, rest) = Ref::<_, HeaderV2>::from_prefix(olean).expect("bad header");
   assert_eq!(&header.magic, b"olean");
   assert_eq!(header.version, 2);
@@ -193,7 +205,8 @@ fn parse_as_v2(olean: &[u8]) -> (Config, Header, u64, &[u8]) {
   githash.copy_from_slice(&header.githash);
   let cfg = Config { use_gmp: header.flags != 0 };
   let lean_version = LeanVersion::parse(&header.lean_version);
-  (cfg, Header { base, lean_version, githash, root: header.root.get() }, offset, rest)
+  let vheader = VHeader { lean_version, githash };
+  (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
 }
 
 fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
@@ -209,28 +222,60 @@ fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
   }
 }
 
-#[derive(Clone, Copy, Default)]
+fn parse_olean_header(version: OLeanVersion, olean: &[u8]) -> (Header, &[u8]) {
+  match version {
+    OLeanVersion::V0 => parse_as_v0(olean),
+    OLeanVersion::V1 => parse_as_v1(olean),
+    OLeanVersion::V2 => parse_as_v2(olean),
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Config {
   use_gmp: bool,
 }
 
-pub fn compress(olean: &[u8], outfile: impl Write) {
+pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
+  let (&olean, cont) = oleans.split_first().unwrap();
   let version = sniff_olean_version(olean);
-
-  let (cfg, Header { githash, lean_version, base, root }, offset, rest) = match version {
-    OLeanVersion::V0 => parse_as_v0(olean),
-    OLeanVersion::V1 => parse_as_v1(olean),
-    OLeanVersion::V2 => parse_as_v2(olean),
-  };
+  assert!(oleans.len() == 1 || version >= OLeanVersion::V2);
+  let (Header { cfg, vheader, base, root, offset }, rest) = parse_olean_header(version, olean);
   assert!(base & !((u32::MAX as u64) << 16) == 0);
-  let mut refs = vec![0u8; rest.len() >> 3];
-  let mut pos = 0;
-  while pos < rest.len() {
-    pos = on_subobjs(cfg, rest, pos, |ptr| {
+  let mut end = base + olean.len() as u64;
+  let mut data = Vec::with_capacity(3);
+  struct Data<'a> {
+    root: u64,
+    offset: usize,
+    rest: &'a [u8],
+  }
+  data.push(Data { root, offset: 0, rest });
+  for olean in cont {
+    assert_eq!(version, sniff_olean_version(olean));
+    let (header2, rest) = parse_olean_header(version, olean);
+    assert_eq!(cfg, header2.cfg);
+    assert_eq!(vheader, header2.vheader);
+    end = end.next_multiple_of(1 << 16);
+    assert_eq!(end, header2.base);
+    end += olean.len() as u64;
+    data.push(Data { root, offset: (header2.offset - offset) as usize, rest });
+  }
+  let VHeader { githash, lean_version } = vheader;
+  let len = {
+    let Data { offset: offset2, rest, .. } = *data.last().unwrap();
+    rest.len() + offset2
+  };
+  let mut refs = vec![0u8; len >> 3];
+  for d in &data {
+    let mut f = |ptr| {
       let b = &mut refs[(ptr - offset) as usize >> 3];
       *b = b.saturating_add(1);
-    });
-    pos = pad_to(pos, 8).1;
+    };
+    let mut pos = 0;
+    while pos < d.rest.len() {
+      pos = on_subobjs(cfg, d.rest, pos, &mut f);
+      pos = pad_to(pos, 8).1;
+    }
+    f(root);
   }
   let mut w = LgzWriter {
     cfg,
@@ -241,6 +286,14 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
     buf: rest,
     depth: 0,
   };
+  let mut new_buf;
+  if !cont.is_empty() {
+    new_buf = vec![0u8; len];
+    for d in &data {
+      new_buf[d.offset..][..d.rest.len()].copy_from_slice(d.rest);
+    }
+    w.buf = &new_buf;
+  }
   match version {
     OLeanVersion::V0 => {
       w.file.write_all(&MAGIC0).unwrap();
@@ -256,7 +309,7 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
     OLeanVersion::V2 => {
       w.file.write_all(&MAGIC2).unwrap();
       w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
-      w.file.write_u64::<LE>(olean.len() as u64).unwrap();
+      w.file.write_u64::<LE>(end - base).unwrap();
       w.file.write_all(&githash).unwrap();
       w.file.write_u8(cfg.use_gmp as u8).unwrap();
       match lean_version {
@@ -270,7 +323,9 @@ pub fn compress(olean: &[u8], outfile: impl Write) {
       }
     }
   }
-  w.write_obj(root, LgzMode::Normal);
+  for d in &data {
+    w.write_obj(d.root, LgzMode::Normal);
+  }
 }
 
 #[repr(C, align(8))]
