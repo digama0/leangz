@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::BufRead;
 use std::io::BufWriter;
 use std::io::Write;
+use std::ops::Range;
 #[cfg(feature = "debug")]
 use std::sync::atomic::Ordering;
 
@@ -111,7 +112,9 @@ fn main() {
       }
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.olean"));
       let file = std::io::BufReader::new(File::open(file).unwrap());
-      std::fs::write(outfile, decompressor.decompress(file)).unwrap()
+      let (buf, r) = decompressor.decompress(file, 1);
+      let [r] = &*r else { unreachable!() };
+      std::fs::write(outfile, &buf[r.clone()]).unwrap()
     }
   } else {
     let compressor = Compressor::new();
@@ -199,13 +202,13 @@ impl Decompressor {
       dict: zstd::dict::DecoderDictionary::copy(ZSTD_DICT_V1),
     }
   }
-  fn decompress(&self, infile: impl BufRead) -> Vec<u8> {
+  fn decompress(&self, infile: impl BufRead, n: usize) -> (Vec<u8>, Vec<Range<usize>>) {
     #[cfg(feature = "flate2")]
     let infile = flate2::read::GzDecoder::new(infile);
     #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
     let infile = zstd::stream::Decoder::new(infile).unwrap();
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let infile = zstd::stream::Decoder::with_prepared_dictionary(infile, &self.dict).unwrap();
-    leangz::lgz::decompress(infile)
+    leangz::lgz::decompress(infile, n)
   }
 }

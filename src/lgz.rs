@@ -3,6 +3,7 @@ use hashbrown::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
+use std::ops::Range;
 #[cfg(feature = "debug")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref, LE as ZLE, U16, U32, U64};
@@ -1391,7 +1392,7 @@ enum LgzVersion {
   V2,
 }
 
-pub fn decompress(mut infile: impl Read) -> Vec<u8> {
+pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<usize>>) {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
   let version = match magic {
@@ -1447,12 +1448,27 @@ pub fn decompress(mut infile: impl Read) -> Vec<u8> {
       w.buf.extend_from_slice(&githash_in);
     }
   }
+  let base_pos = w.buf.len();
   w.buf.write_u64::<LE>(base).unwrap();
   let fixup_pos = w.buf.len();
   w.buf.write_u64::<LE>(0).unwrap(); // fixed below
-  let root = w.write_obj();
-  LE::write_u64(&mut w.buf[fixup_pos..], root);
-  w.buf
+  let header_size = w.buf.len();
+  let mut ranges = vec![];
+  let mut extra = 0;
+  loop {
+    let root = w.write_obj();
+    LE::write_u64(&mut w.buf[(extra + fixup_pos)..], root);
+    ranges.push(extra..w.buf.len());
+    n -= 1;
+    if n == 0 {
+      break
+    }
+    w.buf.resize(w.buf.len().next_multiple_of(1 << 16), 0);
+    extra = w.buf.len();
+    w.buf.extend_from_within(0..header_size);
+    LE::write_u64(&mut w.buf[(extra + base_pos)..], base + extra as u64);
+  }
+  (w.buf, ranges)
 }
 
 pub struct WithPosition<R> {

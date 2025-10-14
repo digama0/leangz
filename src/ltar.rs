@@ -18,7 +18,7 @@ const COMPRESSION_LGZ: u8 = 1;
 const COMPRESSION_HASH_PLAIN: u8 = 2;
 const COMPRESSION_HASH_JSON: u8 = 3;
 const COMPRESSION_HASH_OUTPUT: u8 = 4;
-const COMPRESSION_LGZ_MULTI: u8 = 5;
+const COMPRESSION_LGZ_MODULE: u8 = 5;
 
 pub enum UnpackError {
   IOError(io::Error),
@@ -368,6 +368,12 @@ pub fn unpack<R: BufRead + Seek>(
         false => None,
       })
     };
+    let read_extra =
+      |compression: u8, buf: &mut Vec<_>, tarfile: &mut R| -> Result<Vec<PathBuf>, UnpackError> {
+        (0..if compression == COMPRESSION_LGZ_MODULE { 2 } else { 0 })
+          .map(|_| Ok(read_cstr_path(true, buf, tarfile)?.unwrap().unwrap()))
+          .collect()
+      };
     let trace_path =
       read_cstr_path(false, &mut buf, &mut tarfile)?.flatten().ok_or(UnpackError::BadLtar)?;
     let mut skip = false;
@@ -404,11 +410,15 @@ pub fn unpack<R: BufRead + Seek>(
         std::fs::write(&trace_path, format!("{trace}"))?;
         rollback.push(trace_path);
       } else {
+        let compression = tarfile.read_u8()?;
+        let extra = read_extra(compression, &mut buf, &mut tarfile)?;
         unpack_one(
           version,
           &mut tarfile,
           verbose,
           trace_path,
+          compression,
+          extra,
           &mut buf,
           &mut rollback,
           #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
@@ -418,7 +428,10 @@ pub fn unpack<R: BufRead + Seek>(
     }
     while let Some(path) = read_cstr_path(true, &mut buf, &mut tarfile)? {
       if let Some(path) = path {
-        if skip && matches!(std::fs::exists(&path), Ok(true)) {
+        let compression = tarfile.read_u8()?;
+        let extra = read_extra(compression, &mut buf, &mut tarfile)?;
+        if skip && extra.iter().chain([&path]).all(|path| matches!(std::fs::exists(path), Ok(true)))
+        {
           skip_one(&mut tarfile, verbose, Some(path))?
         } else {
           cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
@@ -427,6 +440,8 @@ pub fn unpack<R: BufRead + Seek>(
             &mut tarfile,
             verbose,
             path,
+            compression,
+            extra,
             &mut buf,
             &mut rollback,
             #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
@@ -451,12 +466,12 @@ pub fn unpack<R: BufRead + Seek>(
   result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unpack_one<R: BufRead>(
-  _version: LtarVersion, tarfile: &mut R, verbose: bool, path: PathBuf, buf: &mut Vec<u8>,
-  rollback: &mut Vec<PathBuf>,
+  _version: LtarVersion, tarfile: &mut R, verbose: bool, path: PathBuf, compression: u8,
+  extra: Vec<PathBuf>, buf: &mut Vec<u8>, rollback: &mut Vec<PathBuf>,
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
 ) -> Result<(), UnpackError> {
-  let compression = tarfile.read_u8()?;
   if verbose {
     println!("copying {}, compression = {compression}", path.display());
   }
@@ -472,7 +487,7 @@ fn unpack_one<R: BufRead>(
       rollback.push(path);
       std::io::copy(&mut { reader }, &mut file)?;
     }
-    COMPRESSION_LGZ => {
+    COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
       buf.clear();
       buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
       tarfile.read_exact(buf)?;
@@ -481,9 +496,12 @@ fn unpack_one<R: BufRead>(
       let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
       #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
       let reader = zstd::stream::Decoder::new(reader)?;
-      let mut file = File::create(&path)?;
-      rollback.push(path);
-      file.write_all(&lgz::decompress(reader))?;
+      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1);
+      for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
+        let mut file = File::create(&path)?;
+        rollback.push(path);
+        file.write_all(&buf[r])?;
+      }
     }
     COMPRESSION_HASH_PLAIN => {
       std::fs::write(&path, format!("{}", tarfile.read_u64::<LE>()?))?;
@@ -613,28 +631,56 @@ pub fn pack(
       _ => pack_zstd(&serde_json::to_vec(&trace)?, &mut tarfile)?,
     };
   }
+
+  #[derive(Debug)]
+  enum Arg {
+    Comment(String),
+    File((u8, String), Option<[(u8, String); 2]>),
+  }
+  let mut new_args = vec![];
   let mut it = args.into_iter();
   while let Some(mut file) = it.next() {
     if file == "-c" {
-      let comment = it.next().expect("expected comment argument");
-      if version >= LtarVersion::V3 {
-        tarfile.write_u8(0)?;
-      }
-      tarfile.write_u8(0)?;
-      tarfile.write_all(comment.as_bytes())?;
-      tarfile.write_u8(0)?;
+      new_args.push(Arg::Comment(it.next().expect("expected comment argument")));
       continue
-    }
-    let mut module = false;
-    if file == "-m" {
-      module = true;
-      file = it.next().expect("expected file");
     }
     let mut idx = 0u8;
     if file == "-i" {
       idx = it.next().expect("expected index argument").parse().expect("expected number");
       file = it.next().expect("expected file");
     }
+    let module = file.ends_with(".olean.private")
+      && (|| {
+        let mut it = new_args.iter();
+        let Some(Arg::File((_, server), None)) = it.next_back() else { return false };
+        let Some(Arg::File((_, olean), None)) = it.next_back() else { return false };
+        olean.ends_with(".olean") && server.ends_with(".olean.server")
+      })();
+    if module {
+      let Some(Arg::File(server, None)) = new_args.pop() else { unreachable!() };
+      let Some(Arg::File(olean, None)) = new_args.pop() else { unreachable!() };
+      new_args.push(Arg::File(olean, Some([server, (idx, file)])))
+    } else {
+      new_args.push(Arg::File((idx, file), None))
+    }
+  }
+
+  if verbose {
+    eprintln!("args: {new_args:?}")
+  }
+  for arg in new_args {
+    let ((idx, file), module) = match arg {
+      Arg::Comment(comment) => {
+        if version >= LtarVersion::V3 {
+          tarfile.write_u8(0)?;
+        }
+        tarfile.write_u8(0)?;
+        tarfile.write_all(comment.as_bytes())?;
+        tarfile.write_u8(0)?;
+        continue
+      }
+      Arg::File(f, m) => (f, m),
+    };
     if version >= LtarVersion::V3 {
       tarfile.write_u8(idx)?;
     } else {
@@ -642,7 +688,7 @@ pub fn pack(
     }
     tarfile.write_all(file.as_bytes())?;
     tarfile.write_u8(0)?;
-    let path = basedirs.get(idx as usize).expect("not enough parent paths").join(file);
+    let path = basedirs.get(idx as usize).expect("not enough parent paths").join(&file);
     if verbose {
       println!("compressing {}", path.display());
     }
@@ -650,11 +696,20 @@ pub fn pack(
     let mmap = unsafe { Mmap::map(&File::open(&path)?)? };
     if is_olean && mmap.get(..5) == Some(b"olean") {
       let mut buf = vec![];
-      tarfile.write_u8(if module { COMPRESSION_LGZ_MULTI } else { COMPRESSION_LGZ })?;
+      tarfile.write_u8(if module.is_some() { COMPRESSION_LGZ_MODULE } else { COMPRESSION_LGZ })?;
       let (server, private);
-      let mmaps: &[&[u8]] = if module {
-        server = unsafe { Mmap::map(&File::open(path.with_extension("olean.server"))?)? };
-        private = unsafe { Mmap::map(&File::open(path.with_extension("olean.private"))?)? };
+      let mmaps: &[&[u8]] = if let Some([f2, f3]) = module {
+        let mut f = |(idx, file): (u8, String)| -> io::Result<_> {
+          if version >= LtarVersion::V3 {
+            tarfile.write_u8(idx)?;
+          } else {
+            assert!(idx == 0);
+          }
+          tarfile.write_all(file.as_bytes())?;
+          tarfile.write_u8(0)?;
+          Ok(unsafe { Mmap::map(&File::open(file)?)? })
+        };
+        (server, private) = (f(f2)?, f(f3)?);
         &[&mmap, &server, &private]
       } else {
         &[&mmap]
