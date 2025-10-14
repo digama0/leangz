@@ -61,7 +61,7 @@ impl TryFrom<Cow<'_, str>> for Hash {
   }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(try_from = "Cow<'_, str>")]
 struct Hash(u64);
 impl Serialize for Hash {
@@ -70,7 +70,7 @@ impl Serialize for Hash {
     ser.serialize_str(&format!("{:016x}", self.0))
   }
 }
-#[derive(Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum Level {
   Trace,
@@ -79,13 +79,14 @@ enum Level {
   Error,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Message {
   message: String,
   level: Level,
 }
 
+#[derive(Debug)]
 struct Descr {
   hash: Hash,
   ext: Cow<'static, str>,
@@ -121,7 +122,7 @@ const ILEAN_EXT: &str = "ilean";
 const C_EXT: &str = "c";
 const BC_EXT: &str = "bc";
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ModuleOutputDescrs {
   #[serde(rename = "o")]
   olean: Vec<Descr>,
@@ -169,6 +170,7 @@ impl TryFrom<&serde_json::Value> for ModuleOutputDescrs {
   }
 }
 
+#[derive(Debug)]
 enum Outputs {
   LeanModule(ModuleOutputDescrs),
   Other(serde_json::Value),
@@ -193,7 +195,7 @@ impl<'de> Deserialize<'de> for Outputs {
   }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(try_from = "Cow<'_, str>")]
 struct HashDec(u64);
 impl Serialize for HashDec {
@@ -207,12 +209,13 @@ impl TryFrom<Cow<'_, str>> for HashDec {
   fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> { value.parse().map(HashDec) }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildTraceV2 {
   dep_hash: HashDec,
 }
 
+#[derive(Debug)]
 enum TraceVersion {
   V3,
 }
@@ -235,7 +238,7 @@ impl<'de> Deserialize<'de> for TraceVersion {
 }
 
 const fn true_fn() -> bool { true }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildTraceV3 {
   schema_version: TraceVersion,
@@ -278,6 +281,7 @@ impl BuildTraceV3 {
   }
 }
 
+#[derive(Debug)]
 enum BuildTrace {
   V1(u64),
   V2(BuildTraceV2),
@@ -402,15 +406,17 @@ pub fn unpack<R: BufRead + Seek>(
     };
     #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
     let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
+    let compression =
+      if version < LtarVersion::V2 { COMPRESSION_HASH_PLAIN } else { tarfile.read_u8()? };
+    let extra = read_extra(compression, &mut buf, &mut tarfile)?;
     if skip && matches!(std::fs::exists(&trace_path), Ok(true)) {
-      skip_one(&mut tarfile, verbose, Some(trace_path))?
+      skip_one(&mut tarfile, verbose, Some(trace_path), compression, &extra)?
     } else {
       cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
       if version < LtarVersion::V2 {
         std::fs::write(&trace_path, format!("{trace}"))?;
         rollback.push(trace_path);
       } else {
-        let compression = tarfile.read_u8()?;
         let extra = read_extra(compression, &mut buf, &mut tarfile)?;
         unpack_one(
           version,
@@ -432,7 +438,7 @@ pub fn unpack<R: BufRead + Seek>(
         let extra = read_extra(compression, &mut buf, &mut tarfile)?;
         if skip && extra.iter().chain([&path]).all(|path| matches!(std::fs::exists(path), Ok(true)))
         {
-          skip_one(&mut tarfile, verbose, Some(path))?
+          skip_one(&mut tarfile, verbose, Some(path), compression, &extra)?
         } else {
           cached_create_dir_all(path.parent().ok_or(UnpackError::BadLtar)?)?;
           unpack_one(
@@ -474,6 +480,9 @@ fn unpack_one<R: BufRead>(
 ) -> Result<(), UnpackError> {
   if verbose {
     println!("copying {}, compression = {compression}", path.display());
+    for path in &extra {
+      println!("      + {}", path.display());
+    }
   }
   match compression {
     COMPRESSION_ZSTD => {
@@ -549,16 +558,18 @@ fn unpack_one<R: BufRead>(
 }
 
 fn skip_one<R: BufRead + Seek>(
-  tarfile: &mut R, verbose: bool, path: Option<PathBuf>,
+  tarfile: &mut R, verbose: bool, path: Option<PathBuf>, compression: u8, extra: &[PathBuf],
 ) -> Result<(), UnpackError> {
-  let compression = tarfile.read_u8()?;
   if verbose {
     if let Some(path) = path {
       println!("skipping {}, compression = {compression}", path.display());
+      for path in extra {
+        println!("       + {}", path.display());
+      }
     }
   }
   let len = match compression {
-    COMPRESSION_ZSTD | COMPRESSION_LGZ => tarfile.read_u64::<LE>()?,
+    COMPRESSION_ZSTD | COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => tarfile.read_u64::<LE>()?,
     COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
     COMPRESSION_HASH_OUTPUT => {
       tarfile.seek(io::SeekFrom::Current(32))?;
@@ -688,7 +699,7 @@ pub fn pack(
     }
     tarfile.write_all(file.as_bytes())?;
     tarfile.write_u8(0)?;
-    let path = basedirs.get(idx as usize).expect("not enough parent paths").join(&file);
+    let path = basedirs.get(idx as usize).expect("not enough parent paths").join(file);
     if verbose {
       println!("compressing {}", path.display());
     }
@@ -707,7 +718,11 @@ pub fn pack(
           }
           tarfile.write_all(file.as_bytes())?;
           tarfile.write_u8(0)?;
-          Ok(unsafe { Mmap::map(&File::open(file)?)? })
+          let path = basedirs.get(idx as usize).expect("not enough parent paths").join(file);
+          if verbose {
+            println!("          + {}", path.display());
+          }
+          Ok(unsafe { Mmap::map(&File::open(path)?)? })
         };
         (server, private) = (f(f2)?, f(f3)?);
         &[&mmap, &server, &private]
@@ -777,7 +792,8 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
     return Err(UnpackError::BadLtar)
   }
   if version >= LtarVersion::V2 {
-    skip_one(&mut tarfile, false, None)?
+    let compression = tarfile.read_u8()?;
+    skip_one(&mut tarfile, false, None, compression, &[])?
   }
   let mut comments = vec![];
   while read_cstr(version >= LtarVersion::V3, &mut buf, &mut tarfile)? {
@@ -787,7 +803,13 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
       }
       comments.push(std::str::from_utf8(&buf)?.to_string());
     } else {
-      skip_one(&mut tarfile, false, None)?;
+      let compression = tarfile.read_u8()?;
+      if compression == COMPRESSION_LGZ_MODULE {
+        for _ in 0..2 {
+          read_cstr(version >= LtarVersion::V3, &mut buf, &mut tarfile)?;
+        }
+      }
+      skip_one(&mut tarfile, false, None, compression, &[])?;
     }
   }
   Ok(comments)

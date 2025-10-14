@@ -1,6 +1,6 @@
 [package]
 name = "leangz"
-version = "0.1.16-pre2"
+version = "0.1.16-pre3"
 edition = "2021"
 default-run = "leangz"
 
