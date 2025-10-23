@@ -64,20 +64,31 @@ fn main() {
     let mut lgzs = 0;
     let mut oleans = 0;
     for file in args {
-      println!("{file}");
-      let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
+      let (server, private) = (format!("{file}.server"), format!("{file}.private"));
+      let module = std::fs::exists(&server).unwrap() && std::fs::exists(&private).unwrap();
+      let mmap = unsafe { Mmap::map(&File::open(&file).unwrap()).unwrap() };
+      let (mmap1, mmap2);
+      let mmaps: &[&[u8]] = if module {
+        println!("{file} (module)");
+        mmap1 = unsafe { Mmap::map(&File::open(server).unwrap()).unwrap() };
+        mmap2 = unsafe { Mmap::map(&File::open(private).unwrap()).unwrap() };
+        &[&mmap, &mmap1, &mmap2]
+      } else {
+        println!("{file}");
+        &[&mmap]
+      };
       let mut lgzfile = vec![];
-      compressor.compress(&[&mmap], std::io::Cursor::new(&mut lgzfile));
-      let oleanfile = decompressor.decompress(std::io::Cursor::new(&lgzfile));
-      assert!(*mmap == *oleanfile);
+      compressor.compress(mmaps, std::io::Cursor::new(&mut lgzfile));
+      let (oleanfile, ranges) =
+        decompressor.decompress(std::io::Cursor::new(&lgzfile), mmaps.len());
+      let mut size = 0;
+      for (&mmap, r) in mmaps.iter().zip(ranges) {
+        size += r.len();
+        assert!(*mmap == oleanfile[r]);
+      }
       lgzs += lgzfile.len();
-      oleans += oleanfile.len();
-      println!(
-        "{} / {} = {:.6}",
-        oleanfile.len(),
-        lgzfile.len(),
-        oleanfile.len() as f64 / lgzfile.len() as f64
-      );
+      oleans += size;
+      println!("{} / {} = {:.6}", size, lgzfile.len(), size as f64 / lgzfile.len() as f64);
     }
     println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
     return
