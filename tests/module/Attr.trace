@@ -1,0 +1,32 @@
+{"synthetic": false,
+ "schemaVersion": "2025-09-10",
+ "outputs":
+ {"r": "5663c04e813b1d02.ir",
+  "o":
+  ["3cca31ffa2f465ef.olean",
+   "56d5b21498fd7c3f.olean.server",
+   "8b675afb28e22dac.olean.private"],
+  "i": "3b9eae88facf7718.ilean",
+  "c": "add47f1b668a8843.c"},
+ "log":
+ [{"message":
+   ".> LEAN_PATH=/Users/kim/projects/lean/mathlib4/.lake/packages/Cli/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/batteries/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/Qq/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/aesop/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/proofwidgets/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/importGraph/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/packages/plausible/.lake/build/lib/lean:/Users/kim/projects/lean/mathlib4/.lake/build/lib/lean /Users/kim/.elan/toolchains/leanprover--lean4---v4.25.0-rc2/bin/lean /Users/kim/projects/lean/mathlib4/.lake/packages/plausible/Plausible/Attr.lean -o /Users/kim/projects/lean/mathlib4/.lake/packages/plausible/.lake/build/lib/lean/Plausible/Attr.olean -i /Users/kim/projects/lean/mathlib4/.lake/packages/plausible/.lake/build/lib/lean/Plausible/Attr.ilean -c /Users/kim/projects/lean/mathlib4/.lake/packages/plausible/.lake/build/ir/Plausible/Attr.c --setup /Users/kim/projects/lean/mathlib4/.lake/packages/plausible/.lake/build/ir/Plausible/Attr.setup.json --json",
+   "level": "trace"}],
+ "inputs":
+ [["Plausible.Attr:deps",
+   [["deps",
+     [["plausible/Plausible:extraDep",
+       [["@plausible:extraDep", "00000000000006bb"]]],
+      ["imports", "00000000000006bb"]]],
+    ["libs",
+     [["import dynlibs", "00000000000006bb"],
+      ["package external libraries", "00000000000006bb"],
+      ["module dynlibs", "00000000000006bb"],
+      ["module plugins", "00000000000006bb"]]]]],
+  ["Lean 4.25.0, commit 744f98064b056ee27fc8c97f524797c8cc96f436",
+   "4bbac11c6209e48b"],
+  ["/Users/kim/projects/lean/mathlib4/.lake/packages/plausible/Plausible/Attr.lean",
+   "012a3dd3e2a4ff56"],
+  ["options", [["-Dexperimental.module=true", "a66e91e2aeb378d2"]]],
+  ["Module.leanArgs: #[]", "00000000000006bb"]],
+ "depHash": "57289f38c9016500"}
