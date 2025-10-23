@@ -258,7 +258,7 @@ pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
     end = end.next_multiple_of(1 << 16);
     assert_eq!(end, header2.base);
     end += olean.len() as u64;
-    data.push(Data { root, offset: (header2.offset - offset) as usize, rest });
+    data.push(Data { root: header2.root, offset: (header2.offset - offset) as usize, rest });
   }
   let VHeader { githash, lean_version } = vheader;
   let len = {
@@ -276,7 +276,7 @@ pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
       pos = on_subobjs(cfg, d.rest, pos, &mut f);
       pos = pad_to(pos, 8).1;
     }
-    f(root);
+    f(d.root);
   }
   let mut w = LgzWriter {
     cfg,
