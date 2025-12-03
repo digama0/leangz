@@ -127,10 +127,11 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
       }
-      Ok(comments) =>
+      Ok(comments) => {
         for comment in comments {
           println!("{comment}")
-        },
+        }
+      }
     }
   } else if do_decompress {
     let mut args_vec = vec![];
@@ -175,11 +176,21 @@ fn main() {
       }
     }
 
+    // Reset profiling counters
+    leangz::profile::reset();
+
     let mut error = AtomicBool::new(false);
     let fail = || error.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    eprintln!(
+      "Starting parallel unpack with {} files, rayon threads: {}",
+      args_vec.len(),
+      rayon::current_num_threads()
+    );
+    let start = std::time::Instant::now();
     args_vec.into_par_iter().for_each(|(basedirs2, file)| {
       if verbose {
-        println!("unpacking {file}");
+        eprintln!("unpacking {file}");
       }
       let mut basedirs = Cow::Borrowed(&basedirs);
       for (i, basedir2) in basedirs2.iter().enumerate() {
@@ -196,7 +207,7 @@ fn main() {
       let tarfile = match File::open(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
           eprintln!("{file} not found");
-          return fail()
+          return fail();
         }
         e => BufReader::new(e.unwrap()),
       };
@@ -217,6 +228,13 @@ fn main() {
         }
       }
     });
+    let wall_time = start.elapsed();
+
+    // Capture and print profiling results
+    let mut snapshot = leangz::profile::ProfileSnapshot::capture();
+    snapshot.wall_time_us = wall_time.as_micros() as usize;
+    snapshot.print_report();
+
     std::process::exit(*error.get_mut() as i32);
   } else {
     let tarfile = args.next().unwrap_or_else(|| help_err("expected OUT.ltar"));

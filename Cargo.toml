@@ -34,3 +34,8 @@ doc = false
 name = "leantar"
 path = "src/tar.rs"
 doc = false
+
+[[bin]]
+name = "leantar-benchmark"
+path = "src/benchmark.rs"
+doc = false
