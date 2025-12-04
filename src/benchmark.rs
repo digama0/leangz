@@ -197,7 +197,7 @@ fn main() {
   let reader = BufReader::new(file);
   let mut ltar_files: Vec<PathBuf> = reader
     .lines()
-    .filter_map(|line| line.ok())
+    .map_while(Result::ok)
     .filter(|line| !line.is_empty() && !line.starts_with('#'))
     .map(|hash| {
       // Support both bare hashes and full paths
