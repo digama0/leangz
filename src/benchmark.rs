@@ -346,9 +346,8 @@ fn run_sweep(manifest_file: Option<PathBuf>, cache_dir: Option<PathBuf>, limit: 
   thread_counts.sort();
   thread_counts.dedup();
 
-  eprintln!("=== Thread Count Sweep ===");
-  eprintln!("Testing thread counts: {:?}", thread_counts);
-  eprintln!("(This will take a few minutes...)");
+  eprintln!("Thread Count Sweep");
+  eprintln!("Testing: {:?}", thread_counts);
   eprintln!();
 
   let exe = std::env::current_exe().expect("Failed to get executable path");
@@ -400,15 +399,11 @@ fn run_sweep(manifest_file: Option<PathBuf>, cache_dir: Option<PathBuf>, limit: 
     results.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
 
   eprintln!();
-  eprintln!("=== Results ===");
-  eprintln!();
-  eprintln!("{:>8} {:>10} {:>10}", "Threads", "Time", "vs Best");
-  eprintln!("{:>8} {:>10} {:>10}", "-------", "--------", "-------");
-
+  eprintln!("Results:");
   for (threads, time) in &results {
     let ratio = time / best_time;
-    let indicator = if threads == best_threads { " <-- best" } else { "" };
-    eprintln!("{:>8} {:>9.2}s {:>9.2}x{}", threads, time, ratio, indicator);
+    let indicator = if threads == best_threads { " (best)" } else { "" };
+    eprintln!("  {} threads: {:.2}s ({:.2}x){}", threads, time, ratio, indicator);
   }
 
   eprintln!();

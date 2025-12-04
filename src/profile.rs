@@ -220,8 +220,7 @@ impl ProfileSnapshot {
     let out_count = self.output_file_count.max(1);
 
     eprintln!();
-    eprintln!("=== PROFILE ===");
-    eprintln!();
+    eprintln!("Profile");
     eprintln!("Wall time:      {:>8.2}s", wall as f64 / 1_000_000.0);
     eprintln!(
       "Total tracked:  {:>8.2}s  ({:.1}x wall, {} threads)",
