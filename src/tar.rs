@@ -127,11 +127,10 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
       }
-      Ok(comments) => {
+      Ok(comments) =>
         for comment in comments {
           println!("{comment}")
-        }
-      }
+        },
     }
   } else if do_decompress {
     let mut args_vec = vec![];

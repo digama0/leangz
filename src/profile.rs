@@ -45,15 +45,11 @@ pub fn add_duration(counter: &AtomicUsize, d: Duration) {
 
 /// Helper to increment count
 #[inline]
-pub fn inc(counter: &AtomicUsize) {
-  counter.fetch_add(1, Ordering::Relaxed);
-}
+pub fn inc(counter: &AtomicUsize) { counter.fetch_add(1, Ordering::Relaxed); }
 
 /// Helper to add value
 #[inline]
-pub fn add(counter: &AtomicUsize, val: usize) {
-  counter.fetch_add(val, Ordering::Relaxed);
-}
+pub fn add(counter: &AtomicUsize, val: usize) { counter.fetch_add(val, Ordering::Relaxed); }
 
 /// Scoped timer that adds elapsed time to a counter on drop
 pub struct ScopedTimer<'a> {
@@ -63,9 +59,7 @@ pub struct ScopedTimer<'a> {
 
 impl<'a> ScopedTimer<'a> {
   #[inline]
-  pub fn new(counter: &'a AtomicUsize) -> Self {
-    Self { counter, start: Instant::now() }
-  }
+  pub fn new(counter: &'a AtomicUsize) -> Self { Self { counter, start: Instant::now() } }
 
   /// Stop the timer and return elapsed duration (also adds to counter)
   #[inline]
@@ -78,74 +72,34 @@ impl<'a> ScopedTimer<'a> {
 }
 
 impl Drop for ScopedTimer<'_> {
-  fn drop(&mut self) {
-    add_duration(self.counter, self.start.elapsed());
-  }
+  fn drop(&mut self) { add_duration(self.counter, self.start.elapsed()); }
 }
 
 // Public accessors for the counters
 pub mod counters {
   use super::*;
 
-  pub fn read_ltar() -> &'static AtomicUsize {
-    &READ_LTAR_US
-  }
-  pub fn zstd_init() -> &'static AtomicUsize {
-    &ZSTD_INIT_US
-  }
-  pub fn decompress() -> &'static AtomicUsize {
-    &DECOMPRESS_US
-  }
-  pub fn file_create() -> &'static AtomicUsize {
-    &FILE_CREATE_US
-  }
-  pub fn file_write() -> &'static AtomicUsize {
-    &FILE_WRITE_US
-  }
-  pub fn file_close() -> &'static AtomicUsize {
-    &FILE_CLOSE_US
-  }
-  pub fn rollback_push() -> &'static AtomicUsize {
-    &ROLLBACK_PUSH_US
-  }
-  pub fn loop_overhead() -> &'static AtomicUsize {
-    &LOOP_OVERHEAD_US
-  }
-  pub fn misc() -> &'static AtomicUsize {
-    &MISC_US
-  }
+  pub fn read_ltar() -> &'static AtomicUsize { &READ_LTAR_US }
+  pub fn zstd_init() -> &'static AtomicUsize { &ZSTD_INIT_US }
+  pub fn decompress() -> &'static AtomicUsize { &DECOMPRESS_US }
+  pub fn file_create() -> &'static AtomicUsize { &FILE_CREATE_US }
+  pub fn file_write() -> &'static AtomicUsize { &FILE_WRITE_US }
+  pub fn file_close() -> &'static AtomicUsize { &FILE_CLOSE_US }
+  pub fn rollback_push() -> &'static AtomicUsize { &ROLLBACK_PUSH_US }
+  pub fn loop_overhead() -> &'static AtomicUsize { &LOOP_OVERHEAD_US }
+  pub fn misc() -> &'static AtomicUsize { &MISC_US }
 
-  pub fn ltar_files() -> &'static AtomicUsize {
-    &LTAR_FILE_COUNT
-  }
-  pub fn output_files() -> &'static AtomicUsize {
-    &OUTPUT_FILE_COUNT
-  }
-  pub fn zstd_files() -> &'static AtomicUsize {
-    &ZSTD_COUNT
-  }
-  pub fn lgz_files() -> &'static AtomicUsize {
-    &LGZ_COUNT
-  }
-  pub fn lgz_module_files() -> &'static AtomicUsize {
-    &LGZ_MODULE_COUNT
-  }
-  pub fn hash_plain_files() -> &'static AtomicUsize {
-    &HASH_PLAIN_COUNT
-  }
-  pub fn hash_json_files() -> &'static AtomicUsize {
-    &HASH_JSON_COUNT
-  }
-  pub fn hash_output_files() -> &'static AtomicUsize {
-    &HASH_OUTPUT_COUNT
-  }
+  pub fn ltar_files() -> &'static AtomicUsize { &LTAR_FILE_COUNT }
+  pub fn output_files() -> &'static AtomicUsize { &OUTPUT_FILE_COUNT }
+  pub fn zstd_files() -> &'static AtomicUsize { &ZSTD_COUNT }
+  pub fn lgz_files() -> &'static AtomicUsize { &LGZ_COUNT }
+  pub fn lgz_module_files() -> &'static AtomicUsize { &LGZ_MODULE_COUNT }
+  pub fn hash_plain_files() -> &'static AtomicUsize { &HASH_PLAIN_COUNT }
+  pub fn hash_json_files() -> &'static AtomicUsize { &HASH_JSON_COUNT }
+  pub fn hash_output_files() -> &'static AtomicUsize { &HASH_OUTPUT_COUNT }
 
-  pub fn compressed_bytes() -> &'static AtomicUsize {
-    &COMPRESSED_BYTES
-  }
-  pub fn decompressed_bytes() -> &'static AtomicUsize {
-    &DECOMPRESSED_BYTES
-  }
+  pub fn compressed_bytes() -> &'static AtomicUsize { &COMPRESSED_BYTES }
+  pub fn decompressed_bytes() -> &'static AtomicUsize { &DECOMPRESSED_BYTES }
 }
 
 /// Reset all counters to zero
@@ -256,9 +210,7 @@ impl ProfileSnapshot {
   }
 
   /// Ideal parallel time (total tracked / thread count)
-  pub fn ideal_parallel_us(&self) -> usize {
-    self.total_tracked_us() / self.thread_count.max(1)
-  }
+  pub fn ideal_parallel_us(&self) -> usize { self.total_tracked_us() / self.thread_count.max(1) }
 
   /// Print detailed report
   pub fn print_report(&self) {
@@ -345,9 +297,7 @@ impl ProfileSnapshot {
 
 impl serde::Serialize for ProfileSnapshot {
   fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
+  where S: serde::Serializer {
     use serde::ser::SerializeStruct;
     let mut s = serializer.serialize_struct("ProfileSnapshot", 20)?;
 

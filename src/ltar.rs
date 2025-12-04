@@ -41,14 +41,10 @@ impl std::fmt::Display for UnpackError {
 }
 
 impl From<io::Error> for UnpackError {
-  fn from(v: io::Error) -> Self {
-    Self::IOError(v)
-  }
+  fn from(v: io::Error) -> Self { Self::IOError(v) }
 }
 impl From<std::str::Utf8Error> for UnpackError {
-  fn from(v: std::str::Utf8Error) -> Self {
-    Self::InvalidUtf8(v)
-  }
+  fn from(v: std::str::Utf8Error) -> Self { Self::InvalidUtf8(v) }
 }
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
@@ -70,9 +66,7 @@ impl TryFrom<Cow<'_, str>> for Hash {
 struct Hash(u64);
 impl Serialize for Hash {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
+  where S: serde::Serializer {
     ser.serialize_str(&format!("{:016x}", self.0))
   }
 }
@@ -99,17 +93,13 @@ struct Descr {
 }
 impl Serialize for Descr {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
+  where S: serde::Serializer {
     ser.serialize_str(&format!("{:016x}.{}", self.hash.0, self.ext))
   }
 }
 impl<'de> Deserialize<'de> for Descr {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
+  where D: serde::Deserializer<'de> {
     let s = <&str>::deserialize(deserializer)?;
     let bad = || serde::de::Error::custom("bad value");
     if s.as_bytes().get(16) != Some(&b'.') {
@@ -164,9 +154,8 @@ impl TryFrom<&serde_json::Value> for ModuleOutputDescrs {
     for (key, val) in value.as_object().ok_or(())? {
       match &**key {
         "o" => assert_none(o.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
-        "i" => {
-          assert_none(ilean.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?
-        }
+        "i" =>
+          assert_none(ilean.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         // "ir" => assert_none(ir.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         "c" => assert_none(c.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
         "b" => assert_none(bc.replace(serde_json::from_value(val.clone()).map_err(|_| ())?), ())?,
@@ -188,9 +177,7 @@ enum Outputs {
 }
 impl Serialize for Outputs {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
+  where S: serde::Serializer {
     match self {
       Outputs::LeanModule(m) => m.serialize(ser),
       Outputs::Other(value) => value.serialize(ser),
@@ -199,9 +186,7 @@ impl Serialize for Outputs {
 }
 impl<'de> Deserialize<'de> for Outputs {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
+  where D: serde::Deserializer<'de> {
     let val: serde_json::Value = Deserialize::deserialize(deserializer)?;
     match (&val).try_into() {
       Ok(m) => Ok(Outputs::LeanModule(m)),
@@ -215,17 +200,13 @@ impl<'de> Deserialize<'de> for Outputs {
 struct HashDec(u64);
 impl Serialize for HashDec {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
+  where S: serde::Serializer {
     ser.serialize_str(&self.0.to_string())
   }
 }
 impl TryFrom<Cow<'_, str>> for HashDec {
   type Error = std::num::ParseIntError;
-  fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> {
-    value.parse().map(HashDec)
-  }
+  fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> { value.parse().map(HashDec) }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,9 +221,7 @@ enum TraceVersion {
 }
 impl Serialize for TraceVersion {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
+  where S: serde::Serializer {
     ser.serialize_str(match self {
       TraceVersion::V3 => "2025-09-10",
     })
@@ -250,9 +229,7 @@ impl Serialize for TraceVersion {
 }
 impl<'de> Deserialize<'de> for TraceVersion {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
+  where D: serde::Deserializer<'de> {
     match &*<Cow<'_, str>>::deserialize(deserializer)? {
       "2025-09-10" => Ok(TraceVersion::V3),
       _ => Err(serde::de::Error::custom("unsupported version")),
@@ -260,9 +237,7 @@ impl<'de> Deserialize<'de> for TraceVersion {
   }
 }
 
-const fn true_fn() -> bool {
-  true
-}
+const fn true_fn() -> bool { true }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildTraceV3 {

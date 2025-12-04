@@ -338,9 +338,7 @@ struct ObjHeader {
   tag: u8,
 }
 impl ObjHeader {
-  fn sfields(&self) -> u16 {
-    (self.cs_sz.get() >> 3).saturating_sub(self.num_fields as u16 + 1)
-  }
+  fn sfields(&self) -> u16 { (self.cs_sz.get() >> 3).saturating_sub(self.num_fields as u16 + 1) }
 }
 
 macro_rules! bin_parser {
@@ -425,7 +423,7 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
       let (_length, pos) = parse_u64(buf, pos);
       pos + capacity as usize
     }
-    tag::MPZ => {
+    tag::MPZ =>
       if cfg.use_gmp {
         let (capacity, pos) = parse_u32(buf, pos);
         let (size, pos) = parse_i32(buf, pos);
@@ -442,8 +440,7 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
         assert!(header.cs_sz.get() == ((size + 8) as u16) << 2 && sign < 2 && size != 0);
         let (_limbs_ptr, pos) = parse_u64(buf, pos);
         pos + (4 * size) as usize
-      }
-    }
+      },
     tag::THUNK | tag::TASK => {
       let (value, pos) = parse_u64(buf, pos);
       let (imp, pos) = parse_u64(buf, pos);
@@ -639,9 +636,7 @@ pub(crate) mod exprish {
     let bvars = bvars1.max(bvars2).max(bvars3.saturating_sub(1));
     pack_expr_data(h, bvars, depth.saturating_add(1), bits1 | bits2 | bits3)
   }
-  pub(crate) fn expr_lit_data(hash: u64) -> u64 {
-    pack_expr_data(mix_hash(3, hash), 0, 0, 0)
-  }
+  pub(crate) fn expr_lit_data(hash: u64) -> u64 { pack_expr_data(mix_hash(3, hash), 0, 0, 0) }
 }
 
 pub(crate) const fn pack_ctor(ctor: u8, num_fields: u8, sfields: u16) -> Option<u8> {
@@ -894,9 +889,7 @@ impl<W: Write> LgzWriter<'_, W> {
     }
   }
 
-  fn is_reused(&mut self, ptr: u64) -> bool {
-    self.refs[(ptr - self.offset) as usize >> 3] > 1
-  }
+  fn is_reused(&mut self, ptr: u64) -> bool { self.refs[(ptr - self.offset) as usize >> 3] > 1 }
 
   fn write_op(&mut self, cur_mode: LgzMode, mode: LgzMode, op: u8) {
     #[cfg(feature = "debug")]
@@ -1509,9 +1502,7 @@ impl<W: Write> Write for WithPosition<W> {
     Ok(())
   }
 
-  fn flush(&mut self) -> std::io::Result<()> {
-    self.r.flush()
-  }
+  fn flush(&mut self) -> std::io::Result<()> { self.r.flush() }
 }
 
 struct LgzDecompressor<R> {
@@ -1526,9 +1517,7 @@ struct LgzDecompressor<R> {
 }
 
 impl<R: Read> LgzDecompressor<R> {
-  fn pos(&self) -> u64 {
-    self.offset + self.buf.len() as u64
-  }
+  fn pos(&self) -> u64 { self.offset + self.buf.len() as u64 }
   fn write_header(&mut self, tag: u8, cs_sz: u16, num_fields: u8) -> u64 {
     let pos = self.pos();
     // let start = self.buf.len();
@@ -1589,13 +1578,9 @@ impl<R: Read> LgzDecompressor<R> {
     }
   }
 
-  fn write_u32(&mut self, n: u32) {
-    self.buf.write_u32::<LE>(n).unwrap();
-  }
+  fn write_u32(&mut self, n: u32) { self.buf.write_u32::<LE>(n).unwrap(); }
 
-  fn write_u64(&mut self, n: u64) {
-    self.buf.write_u64::<LE>(n).unwrap();
-  }
+  fn write_u64(&mut self, n: u64) { self.buf.write_u64::<LE>(n).unwrap(); }
 
   fn write_ctor_header(&mut self, ctor: u8, num_fields: u8, sfields: u16) -> u64 {
     self.write_header(ctor, (num_fields as u16 + 1 + sfields) << 3, num_fields)
@@ -1893,9 +1878,8 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
 
-      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) => {
-        ((self.read_i64(tag) << 1) | 1) as u64
-      }
+      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
+        ((self.read_i64(tag) << 1) | 1) as u64,
       SAVE => {
         // self.depth -= 1;
         let pos = self.write_exprish();
@@ -2024,9 +2008,8 @@ impl<R: Read> LgzDecompressor<R> {
         let (num_fields, sfields) = unpack_ctor(tag);
         pos = self.write_ctor(ctor, num_fields, sfields)
       }
-      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) => {
-        pos = ((self.read_i64(tag) << 1) | 1) as u64
-      }
+      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
+        pos = ((self.read_i64(tag) << 1) | 1) as u64,
     }
     // self.depth -= 1;
     // println!(
