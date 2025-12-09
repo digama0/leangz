@@ -142,7 +142,7 @@ fn main() {
     eprintln!("Error: No benchmark manifest found.");
     eprintln!();
     eprintln!("To create a manifest for a specific mathlib version:");
-    eprintln!("  leantar-benchmark --create-manifest v4.26.0-rc1");
+    eprintln!("  leantar-benchmark --create-manifest v4.26.0-rc2");
     eprintln!();
     eprintln!("This will clone mathlib, download cache files, and save");
     eprintln!("the manifest to benchmarks/mathlib-<TAG>.manifest");
@@ -319,13 +319,13 @@ EXAMPLES:
     leantar-benchmark --sweep
 
     # Create a reproducible manifest for a specific mathlib version
-    leantar-benchmark --create-manifest v4.26.0-rc1
+    leantar-benchmark --create-manifest v4.26.0-rc2
 
     # Use 4 threads and limit to 100 files
     leantar-benchmark -j 4 -l 100
 
     # Use specific manifest and cache directory
-    leantar-benchmark -m benchmarks/mathlib-v4.26.0-rc1.manifest ~/.cache/mathlib
+    leantar-benchmark -m benchmarks/mathlib-v4.26.0-rc2.manifest ~/.cache/mathlib
 
     # Output JSON for programmatic consumption
     leantar-benchmark --json > results.json
