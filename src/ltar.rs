@@ -242,10 +242,10 @@ const fn true_fn() -> bool { true }
 #[serde(rename_all = "camelCase")]
 struct BuildTraceV3 {
   schema_version: TraceVersion,
-  #[serde(skip_serializing_if = "Vec::is_empty")]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   log: Vec<Message>,
   dep_hash: Hash,
-  #[serde(skip_serializing_if = "Option::is_none")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   outputs: Option<Outputs>,
   #[allow(dead_code)]
   #[serde(skip_serializing, default = "true_fn")]
