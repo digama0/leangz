@@ -91,7 +91,7 @@ fn main() {
       println!("{} / {} = {:.6}", size, lgzfile.len(), size as f64 / lgzfile.len() as f64);
     }
     println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
-    return
+    return;
   }
   #[cfg(feature = "zstd-train")]
   if do_training {
@@ -113,7 +113,7 @@ fn main() {
     let outfile = outfile.take().unwrap_or_else(|| format!("src/lgz.dict"));
     let dict = zstd::dict::from_continuous(&samples, &sizes, max_size).unwrap();
     std::fs::write(outfile, dict).unwrap();
-    return
+    return;
   }
   if do_decompress {
     let decompressor = Decompressor::new();
@@ -148,7 +148,7 @@ fn main() {
         );
       }
       println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
-      return
+      return;
     }
     for file in args {
       if verbose {

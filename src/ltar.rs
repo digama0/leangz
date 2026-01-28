@@ -103,7 +103,7 @@ impl<'de> Deserialize<'de> for Descr {
     let s = <&str>::deserialize(deserializer)?;
     let bad = || serde::de::Error::custom("bad value");
     if s.as_bytes().get(16) != Some(&b'.') {
-      return Err(bad())
+      return Err(bad());
     }
     let hash = Hash(u64::from_str_radix(&s[..16], 16).map_err(|_| bad())?);
     Ok(Descr { hash, ext: s[17..].to_owned().into() })
@@ -164,7 +164,7 @@ impl TryFrom<&serde_json::Value> for ModuleOutputDescrs {
     }
     let olean: Vec<Descr> = o.ok_or(())?;
     if olean.len() != 1 {
-      return Err(())
+      return Err(());
     }
     Ok(Self { olean, ilean: ilean.ok_or(())?, c: c.ok_or(())?, bc })
   }
@@ -264,7 +264,7 @@ impl BuildTraceV3 {
   }
   fn is_simple(&self) -> bool {
     if !self.log.is_empty() {
-      return false
+      return false;
     }
     match self.outputs.as_ref() {
       None => true,
@@ -388,7 +388,7 @@ pub fn unpack<R: BufRead + Seek>(
         if verbose {
           println!("not unpacking because the trace matches\n{}", trace_path.display());
         }
-        return Ok(trace)
+        return Ok(trace);
       }
     }
     let mut cached_create_dir_all = {
@@ -459,7 +459,7 @@ pub fn unpack<R: BufRead + Seek>(
           println!("comment: {}", std::str::from_utf8(&buf)?);
         }
       } else {
-        return Err(UnpackError::BadLtar)
+        return Err(UnpackError::BadLtar);
       }
     }
     Ok(trace)
@@ -470,6 +470,73 @@ pub fn unpack<R: BufRead + Seek>(
     }
   }
   result
+}
+
+use crate::profile::{add, add_duration, counters, inc};
+
+/// Helper for LGZ decompression with detailed profiling
+#[allow(clippy::too_many_arguments)]
+fn unpack_lgz<R: BufRead>(
+  tarfile: &mut R, path: PathBuf, extra: Vec<PathBuf>, buf: &mut Vec<u8>,
+  rollback: &mut Vec<PathBuf>,
+  #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
+) -> Result<(), UnpackError> {
+  // Read compressed data from .ltar
+  let t_read = std::time::Instant::now();
+  buf.clear();
+  let compressed_size = tarfile.read_u64::<LE>()? as usize;
+  buf.resize(compressed_size, 0);
+  tarfile.read_exact(buf)?;
+  add_duration(counters::read_ltar(), t_read.elapsed());
+  add(counters::compressed_bytes(), compressed_size);
+
+  // Initialize zstd decoder
+  let t_init = std::time::Instant::now();
+  let reader = std::io::Cursor::new(&**buf);
+  #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+  let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
+  #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
+  let reader = zstd::stream::Decoder::new(reader)?;
+  add_duration(counters::zstd_init(), t_init.elapsed());
+
+  // Decompress (zstd + lgz)
+  let t_decomp = std::time::Instant::now();
+  let (decompressed_buf, ranges) = lgz::decompress(reader, extra.len() + 1);
+  add_duration(counters::decompress(), t_decomp.elapsed());
+
+  let decompressed_size: usize = ranges.iter().map(|r| r.len()).sum();
+  add(counters::decompressed_bytes(), decompressed_size);
+
+  // Write output files
+  let paths_iter = [path].into_iter().chain(extra);
+
+  for (r, path) in ranges.into_iter().zip(paths_iter) {
+    // Create file
+    let t_create = std::time::Instant::now();
+    let mut file = File::create(&path)?;
+    add_duration(counters::file_create(), t_create.elapsed());
+
+    // Rollback push
+    let t_push = std::time::Instant::now();
+    rollback.push(path);
+    add_duration(counters::rollback_push(), t_push.elapsed());
+
+    // Write data
+    let t_write = std::time::Instant::now();
+    file.write_all(&decompressed_buf[r])?;
+    add_duration(counters::file_write(), t_write.elapsed());
+
+    // Close file
+    let t_close = std::time::Instant::now();
+    drop(file);
+    add_duration(counters::file_close(), t_close.elapsed());
+
+    inc(counters::output_files());
+  }
+
+  // Track any loop overhead (time between operations)
+  // This is approximated by tracking the total vs sum of parts
+  Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,44 +551,77 @@ fn unpack_one<R: BufRead>(
       println!("      + {}", path.display());
     }
   }
+  inc(counters::ltar_files());
   match compression {
     COMPRESSION_ZSTD => {
+      inc(counters::zstd_files());
+
+      // Read compressed data
+      let t0 = std::time::Instant::now();
       buf.clear();
-      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
+      let compressed_size = tarfile.read_u64::<LE>()? as usize;
+      buf.resize(compressed_size, 0);
       tarfile.read_exact(buf)?;
+      add_duration(counters::read_ltar(), t0.elapsed());
+      add(counters::compressed_bytes(), compressed_size);
+
+      // Create decoder
+      let t1 = std::time::Instant::now();
       let reader = std::io::Cursor::new(&**buf);
       #[cfg(feature = "zstd")]
       let reader = zstd::stream::Decoder::new(reader)?;
+      add_duration(counters::zstd_init(), t1.elapsed());
+
+      // Create file
+      let t2 = std::time::Instant::now();
       let mut file = File::create(&path)?;
+      add_duration(counters::file_create(), t2.elapsed());
+
+      // Rollback push
+      let t3 = std::time::Instant::now();
       rollback.push(path);
-      std::io::copy(&mut { reader }, &mut file)?;
+      add_duration(counters::rollback_push(), t3.elapsed());
+
+      // Decompress + write (interleaved via io::copy)
+      let t4 = std::time::Instant::now();
+      let bytes_written = std::io::copy(&mut { reader }, &mut file)?;
+      add_duration(counters::file_write(), t4.elapsed());
+      add(counters::decompressed_bytes(), bytes_written as usize);
+
+      // Close
+      let t5 = std::time::Instant::now();
+      drop(file);
+      add_duration(counters::file_close(), t5.elapsed());
+
+      inc(counters::output_files());
     }
-    COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
-      buf.clear();
-      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-      tarfile.read_exact(buf)?;
-      let reader = std::io::Cursor::new(&**buf);
-      #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-      let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
-      #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
-      let reader = zstd::stream::Decoder::new(reader)?;
-      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1);
-      for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
-        let mut file = File::create(&path)?;
-        rollback.push(path);
-        file.write_all(&buf[r])?;
-      }
+    COMPRESSION_LGZ => {
+      inc(counters::lgz_files());
+      unpack_lgz(tarfile, path, extra, buf, rollback, dict)?;
+    }
+    COMPRESSION_LGZ_MODULE => {
+      inc(counters::lgz_module_files());
+      unpack_lgz(tarfile, path, extra, buf, rollback, dict)?;
     }
     COMPRESSION_HASH_PLAIN => {
+      inc(counters::hash_plain_files());
+      let t = std::time::Instant::now();
       std::fs::write(&path, format!("{}", tarfile.read_u64::<LE>()?))?;
+      add_duration(counters::file_write(), t.elapsed());
       rollback.push(path);
+      inc(counters::output_files());
     }
     COMPRESSION_HASH_JSON => {
+      inc(counters::hash_json_files());
       let b = BuildTraceV2 { dep_hash: HashDec(tarfile.read_u64::<LE>()?) };
+      let t = std::time::Instant::now();
       std::fs::write(&path, serde_json::to_vec(&b).unwrap())?;
+      add_duration(counters::file_write(), t.elapsed());
       rollback.push(path);
+      inc(counters::output_files());
     }
     COMPRESSION_HASH_OUTPUT => {
+      inc(counters::hash_output_files());
       let hash = tarfile.read_u64::<LE>()?;
       let mut m = ModuleOutputDescrs {
         olean: vec![Descr::new(tarfile.read_u64::<LE>()?, OLEAN_EXTS[0])],
@@ -549,8 +649,11 @@ fn unpack_one<R: BufRead>(
         }
       }
       let b = BuildTraceV3::from_hash(hash, Some(Outputs::LeanModule(m)));
+      let t = std::time::Instant::now();
       std::fs::write(&path, serde_json::to_vec(&b).unwrap())?;
+      add_duration(counters::file_write(), t.elapsed());
       rollback.push(path);
+      inc(counters::output_files());
     }
     compression => return Err(UnpackError::UnsupportedCompression(compression)),
   }
@@ -653,7 +756,7 @@ pub fn pack(
   while let Some(mut file) = it.next() {
     if file == "-c" {
       new_args.push(Arg::Comment(it.next().expect("expected comment argument")));
-      continue
+      continue;
     }
     let mut idx = 0u8;
     if file == "-i" {
@@ -688,7 +791,7 @@ pub fn pack(
         tarfile.write_u8(0)?;
         tarfile.write_all(comment.as_bytes())?;
         tarfile.write_u8(0)?;
-        continue
+        continue;
       }
       Arg::File(f, m) => (f, m),
     };
@@ -744,7 +847,7 @@ pub fn pack(
       tarfile.write_all(&buf)?;
     } else if let Some(n) = (|| {
       if mmap.len() > 20 {
-        return None
+        return None;
       }
       std::str::from_utf8(&mmap).ok()?.parse::<u64>().ok()
     })() {
@@ -789,7 +892,7 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
     Ok(buf.pop().is_some())
   };
   if !read_cstr(false, &mut buf, &mut tarfile)? {
-    return Err(UnpackError::BadLtar)
+    return Err(UnpackError::BadLtar);
   }
   if version >= LtarVersion::V2 {
     let compression = tarfile.read_u8()?;
@@ -799,7 +902,7 @@ pub fn comments<R: BufRead + Seek>(mut tarfile: R) -> Result<Vec<String>, Unpack
   while read_cstr(version >= LtarVersion::V3, &mut buf, &mut tarfile)? {
     if buf.is_empty() {
       if !read_cstr(false, &mut buf, &mut tarfile)? {
-        return Err(UnpackError::BadLtar)
+        return Err(UnpackError::BadLtar);
       }
       comments.push(std::str::from_utf8(&buf)?.to_string());
     } else {
