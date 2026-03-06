@@ -1,6 +1,6 @@
 [package]
 name = "leangz"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 default-run = "leangz"
 
@@ -24,6 +24,7 @@ zstd = { version = "0.13", optional = true }
 rayon = "1.7"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3.26"
 
 [[bin]]
 name = "leangz"

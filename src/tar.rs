@@ -221,7 +221,8 @@ fn main() {
   } else {
     let tarfile = args.next().unwrap_or_else(|| help_err("expected OUT.ltar"));
     let trace_path = args.next().unwrap_or_else(|| help_err("expected FILE.trace"));
-    let tarfile = BufWriter::new(File::create(tarfile).unwrap());
-    ltar::pack(&basedirs, tarfile, &trace_path, args, verbose).unwrap()
+    let mut temp = tempfile::NamedTempFile::new().unwrap();
+    ltar::pack(&basedirs, BufWriter::new(&mut temp), &trace_path, args, verbose).unwrap();
+    temp.persist(tarfile).unwrap();
   }
 }
