@@ -157,13 +157,13 @@ fn main() {
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.lgz"));
       let mmap = unsafe { Mmap::map(&File::open(file).unwrap()).unwrap() };
       oleans += mmap.len();
-      let mut temp = tempfile::NamedTempFile::new().unwrap();
-      let r = BufWriter::new(&mut temp);
+      let mut temp = leangz::TempFile::new(outfile.into()).unwrap();
+      let r = BufWriter::new(&mut *temp);
       let mut w = leangz::lgz::WithPosition { r, pos: 0 };
       compressor.compress(&[&mmap], &mut w);
       lgzs += w.pos;
       drop(w);
-      temp.persist(outfile).unwrap();
+      temp.save().unwrap();
     }
     println!("{} / {} = {:.6}", oleans, lgzs, oleans as f64 / lgzs as f64);
   }

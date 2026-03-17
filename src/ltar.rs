@@ -1,3 +1,4 @@
+use crate::TempFile;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,6 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
 use crate::lgz;
 
@@ -414,9 +414,9 @@ pub fn unpack<R: BufRead + Seek>(
   } else {
     cached_create_dir_all(trace_path.parent().ok_or(UnpackError::BadLtar)?)?;
     if version < LtarVersion::V2 {
-      let mut file = NamedTempFile::new()?;
+      let mut file = TempFile::new(trace_path)?;
       write!(&mut file, "{trace}")?;
-      uncommitted.push((file, trace_path));
+      uncommitted.push(file);
     } else {
       let extra = read_extra(compression, &mut buf, &mut tarfile)?;
       unpack_one(
@@ -463,11 +463,11 @@ pub fn unpack<R: BufRead + Seek>(
     }
   }
   let mut rollback = vec![];
-  if let Err(e) = (uncommitted.into_iter())
-    .try_for_each(|(file, path)| file.persist(&path).map(|_| rollback.push(path)))
+  if let Err(e) =
+    uncommitted.into_iter().try_for_each(|file| file.save().map(|path| rollback.push(path)))
   {
     rollback.into_iter().for_each(|file| drop(std::fs::remove_file(file)));
-    Err(e.error.into())
+    Err(e.into())
   } else {
     Ok(trace)
   }
@@ -476,7 +476,7 @@ pub fn unpack<R: BufRead + Seek>(
 #[allow(clippy::too_many_arguments)]
 fn unpack_one<R: BufRead>(
   _version: LtarVersion, tarfile: &mut R, verbose: bool, path: PathBuf, compression: u8,
-  extra: Vec<PathBuf>, buf: &mut Vec<u8>, uncommitted: &mut Vec<(NamedTempFile, PathBuf)>,
+  extra: Vec<PathBuf>, buf: &mut Vec<u8>, uncommitted: &mut Vec<TempFile>,
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
 ) -> Result<(), UnpackError> {
   if verbose {
@@ -493,9 +493,9 @@ fn unpack_one<R: BufRead>(
       let reader = std::io::Cursor::new(&**buf);
       #[cfg(feature = "zstd")]
       let reader = zstd::stream::Decoder::new(reader)?;
-      let mut file = NamedTempFile::new()?;
-      std::io::copy(&mut { reader }, &mut file)?;
-      uncommitted.push((file, path));
+      let mut file = TempFile::new(path)?;
+      std::io::copy(&mut { reader }, &mut *file)?;
+      uncommitted.push(file);
     }
     COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
       buf.clear();
@@ -508,21 +508,21 @@ fn unpack_one<R: BufRead>(
       let reader = zstd::stream::Decoder::new(reader)?;
       let (buf, ranges) = lgz::decompress(reader, extra.len() + 1);
       for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
-        let mut file = NamedTempFile::new()?;
+        let mut file = TempFile::new(path)?;
         file.write_all(&buf[r])?;
-        uncommitted.push((file, path));
+        uncommitted.push(file);
       }
     }
     COMPRESSION_HASH_PLAIN => {
-      let mut file = NamedTempFile::new()?;
+      let mut file = TempFile::new(path)?;
       write!(&mut file, "{}", tarfile.read_u64::<LE>()?)?;
-      uncommitted.push((file, path));
+      uncommitted.push(file);
     }
     COMPRESSION_HASH_JSON => {
       let b = BuildTraceV2 { dep_hash: HashDec(tarfile.read_u64::<LE>()?) };
-      let mut file = NamedTempFile::new()?;
+      let mut file = TempFile::new(path)?;
       file.write_all(&serde_json::to_vec(&b).unwrap())?;
-      uncommitted.push((file, path));
+      uncommitted.push(file);
     }
     COMPRESSION_HASH_OUTPUT => {
       let hash = tarfile.read_u64::<LE>()?;
@@ -552,9 +552,9 @@ fn unpack_one<R: BufRead>(
         }
       }
       let b = BuildTraceV3::from_hash(hash, Some(Outputs::LeanModule(m)));
-      let mut file = NamedTempFile::new()?;
+      let mut file = TempFile::new(path)?;
       file.write_all(&serde_json::to_vec(&b).unwrap())?;
-      uncommitted.push((file, path));
+      uncommitted.push(file);
     }
     compression => return Err(UnpackError::UnsupportedCompression(compression)),
   }
