@@ -20,6 +20,7 @@ const COMPRESSION_HASH_PLAIN: u8 = 2;
 const COMPRESSION_HASH_JSON: u8 = 3;
 const COMPRESSION_HASH_OUTPUT: u8 = 4;
 const COMPRESSION_LGZ_MODULE: u8 = 5;
+const COMPRESSION_HASH0_OUTPUT: u8 = 6;
 
 pub enum UnpackError {
   IOError(io::Error),
@@ -27,6 +28,7 @@ pub enum UnpackError {
   BadLtar,
   NotEnoughPaths(u8),
   UnsupportedCompression(u8),
+  MissingHash,
 }
 
 impl std::fmt::Display for UnpackError {
@@ -37,6 +39,10 @@ impl std::fmt::Display for UnpackError {
       UnpackError::BadLtar => write!(f, "bad .ltar file"),
       UnpackError::NotEnoughPaths(n) => write!(f, "not enough base paths (expected > {n})"),
       UnpackError::UnsupportedCompression(c) => write!(f, "unsupported compression {c}"),
+      UnpackError::MissingHash => write!(
+        f,
+        "this .ltar was packed with -s (no depHash); an override hash must be supplied to unpack it"
+      ),
     }
   }
 }
@@ -53,6 +59,7 @@ enum LtarVersion {
   V1,
   V2,
   V3,
+  V4,
 }
 
 impl TryFrom<Cow<'_, str>> for Hash {
@@ -101,7 +108,7 @@ impl Serialize for Descr {
 impl<'de> Deserialize<'de> for Descr {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where D: serde::Deserializer<'de> {
-    let s = <&str>::deserialize(deserializer)?;
+    let s = Cow::<'_, str>::deserialize(deserializer)?;
     let bad = || serde::de::Error::custom("bad value");
     if s.as_bytes().get(16) != Some(&b'.') {
       return Err(bad())
@@ -216,6 +223,8 @@ struct BuildTraceV2 {
   dep_hash: HashDec,
 }
 
+const TRACE_SCHEMA_V3: &str = "2025-09-10";
+
 #[derive(Debug)]
 enum TraceVersion {
   V3,
@@ -224,7 +233,7 @@ impl Serialize for TraceVersion {
   fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
   where S: serde::Serializer {
     ser.serialize_str(match self {
-      TraceVersion::V3 => "2025-09-10",
+      TraceVersion::V3 => TRACE_SCHEMA_V3,
     })
   }
 }
@@ -232,7 +241,7 @@ impl<'de> Deserialize<'de> for TraceVersion {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where D: serde::Deserializer<'de> {
     match &*<Cow<'_, str>>::deserialize(deserializer)? {
-      "2025-09-10" => Ok(TraceVersion::V3),
+      TRACE_SCHEMA_V3 => Ok(TraceVersion::V3),
       _ => Err(serde::de::Error::custom("unsupported version")),
     }
   }
@@ -245,7 +254,8 @@ struct BuildTraceV3 {
   schema_version: TraceVersion,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   log: Vec<Message>,
-  dep_hash: Hash,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  dep_hash: Option<Hash>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   outputs: Option<Outputs>,
   #[allow(dead_code)]
@@ -254,11 +264,11 @@ struct BuildTraceV3 {
 }
 
 impl BuildTraceV3 {
-  fn from_hash(hash: u64, outputs: Option<Outputs>) -> Self {
+  fn from_hash(hash: Option<u64>, outputs: Option<Outputs>) -> Self {
     Self {
       schema_version: TraceVersion::V3,
       log: vec![],
-      dep_hash: Hash(hash),
+      dep_hash: hash.map(Hash),
       outputs,
       synthetic: true,
     }
@@ -295,7 +305,7 @@ impl BuildTrace {
     match self {
       BuildTrace::V1(n) => Some(*n),
       BuildTrace::V2(b) => Some(b.dep_hash.0),
-      BuildTrace::V3(b) => Some(b.dep_hash.0),
+      BuildTrace::V3(b) => b.dep_hash.as_ref().map(|h| h.0),
       _ => None,
     }
   }
@@ -333,17 +343,36 @@ fn get_version<R: BufRead>(tarfile: &mut R) -> Result<LtarVersion, UnpackError> 
     b"LTAR" => LtarVersion::V1,
     b"LTR2" => LtarVersion::V2,
     b"LTR3" => LtarVersion::V3,
+    b"LTR4" => LtarVersion::V4,
     _ => return Err(UnpackError::BadLtar),
   })
 }
 
 pub fn unpack<R: BufRead + Seek>(
-  basedir: &[PathBuf], mut tarfile: R, force: bool, verbose: bool,
+  basedir: &[PathBuf], mut tarfile: R, force: bool, trace_override: Option<u64>, verbose: bool,
 ) -> Result<u64, UnpackError> {
   let version = get_version(&mut tarfile)?;
   let mut buf = vec![];
   let mut uncommitted = vec![];
-  let trace = tarfile.read_u64::<LE>()?;
+  let file_hash = if version >= LtarVersion::V4 {
+    match tarfile.read_u8()? {
+      0 => None,
+      1 => Some(tarfile.read_u64::<LE>()?),
+      _ => return Err(UnpackError::BadLtar),
+    }
+  } else {
+    Some(tarfile.read_u64::<LE>()?)
+  };
+  let trace = match (trace_override, file_hash) {
+    (Some(trace), Some(_)) => {
+      // Warn at most once across the whole run, even when unpacking many files in parallel.
+      static WARNED: std::sync::Once = std::sync::Once::new();
+      WARNED.call_once(|| eprintln!("warning: overriding the depHash stored in the .ltar file(s)"));
+      trace
+    }
+    (Some(trace), None) | (None, Some(trace)) => trace,
+    (None, None) => return Err(UnpackError::MissingHash),
+  };
   let read_cstr = |buf: &mut Vec<_>, tarfile: &mut R| -> Result<bool, UnpackError> {
     buf.clear();
     tarfile.read_until(0, buf)?;
@@ -422,6 +451,7 @@ pub fn unpack<R: BufRead + Seek>(
       unpack_one(
         version,
         &mut tarfile,
+        trace_override,
         verbose,
         trace_path,
         compression,
@@ -444,6 +474,7 @@ pub fn unpack<R: BufRead + Seek>(
         unpack_one(
           version,
           &mut tarfile,
+          None,
           verbose,
           path,
           compression,
@@ -475,8 +506,9 @@ pub fn unpack<R: BufRead + Seek>(
 
 #[allow(clippy::too_many_arguments)]
 fn unpack_one<R: BufRead>(
-  _version: LtarVersion, tarfile: &mut R, verbose: bool, path: PathBuf, compression: u8,
-  extra: Vec<PathBuf>, buf: &mut Vec<u8>, uncommitted: &mut Vec<TempFile>,
+  _version: LtarVersion, tarfile: &mut R, trace_override: Option<u64>, verbose: bool,
+  path: PathBuf, compression: u8, extra: Vec<PathBuf>, buf: &mut Vec<u8>,
+  uncommitted: &mut Vec<TempFile>,
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
 ) -> Result<(), UnpackError> {
   if verbose {
@@ -494,7 +526,22 @@ fn unpack_one<R: BufRead>(
       #[cfg(feature = "zstd")]
       let reader = zstd::stream::Decoder::new(reader)?;
       let mut file = TempFile::new(path)?;
-      std::io::copy(&mut { reader }, &mut *file)?;
+      if let Some(hash) = trace_override {
+        // The depHash was stripped from this opaque trace at pack time; parse the
+        // JSON straight out of the decompression stream and splice it back in,
+        // without needing to understand the rest of the schema.
+        let mut value = serde_json::from_reader::<_, serde_json::Value>(reader)
+          .map_err(|_| UnpackError::BadLtar)?;
+        if let Some(obj) = value
+          .as_object_mut()
+          .filter(|o| o.get("schemaVersion").and_then(|v| v.as_str()) == Some(TRACE_SCHEMA_V3))
+        {
+          obj.insert("depHash".into(), serde_json::Value::String(format!("{hash:016x}")));
+        }
+        file.write_all(&serde_json::to_vec(&value).unwrap())?;
+      } else {
+        std::io::copy(&mut { reader }, &mut *file)?;
+      }
       uncommitted.push(file);
     }
     COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
@@ -515,17 +562,21 @@ fn unpack_one<R: BufRead>(
     }
     COMPRESSION_HASH_PLAIN => {
       let mut file = TempFile::new(path)?;
-      write!(&mut file, "{}", tarfile.read_u64::<LE>()?)?;
+      let trace = trace_override.unwrap_or(tarfile.read_u64::<LE>()?);
+      write!(&mut file, "{trace}")?;
       uncommitted.push(file);
     }
     COMPRESSION_HASH_JSON => {
-      let b = BuildTraceV2 { dep_hash: HashDec(tarfile.read_u64::<LE>()?) };
+      let trace = trace_override.unwrap_or(tarfile.read_u64::<LE>()?);
+      let b = BuildTraceV2 { dep_hash: HashDec(trace) };
       let mut file = TempFile::new(path)?;
       file.write_all(&serde_json::to_vec(&b).unwrap())?;
       uncommitted.push(file);
     }
-    COMPRESSION_HASH_OUTPUT => {
-      let hash = tarfile.read_u64::<LE>()?;
+    COMPRESSION_HASH_OUTPUT | COMPRESSION_HASH0_OUTPUT => {
+      let hash =
+        if compression == COMPRESSION_HASH_OUTPUT { Some(tarfile.read_u64::<LE>()?) } else { None };
+      let hash = trace_override.or(hash);
       let mut m = ModuleOutputDescrs {
         olean: vec![Descr::new(tarfile.read_u64::<LE>()?, OLEAN_EXTS[0])],
         ilean: Descr::new(tarfile.read_u64::<LE>()?, ILEAN_EXT),
@@ -575,8 +626,9 @@ fn skip_one<R: BufRead + Seek>(
   let len = match compression {
     COMPRESSION_ZSTD | COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => tarfile.read_u64::<LE>()?,
     COMPRESSION_HASH_PLAIN | COMPRESSION_HASH_JSON => 8,
-    COMPRESSION_HASH_OUTPUT => {
-      tarfile.seek(io::SeekFrom::Current(32))?;
+    COMPRESSION_HASH_OUTPUT | COMPRESSION_HASH0_OUTPUT => {
+      let n = if compression == COMPRESSION_HASH_OUTPUT { 32 } else { 24 };
+      tarfile.seek(io::SeekFrom::Current(n))?;
       loop {
         match tarfile.read_u8()? {
           OUTPUT_HASH_END => return Ok(()),
@@ -594,37 +646,56 @@ fn skip_one<R: BufRead + Seek>(
 
 pub fn pack(
   basedirs: &[PathBuf], mut tarfile: impl Write, trace_path: &str,
-  args: impl IntoIterator<Item = String>, verbose: bool,
+  args: impl IntoIterator<Item = String>, include_hash: bool, verbose: bool,
 ) -> io::Result<()> {
-  let (version, trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
+  let (mut version, mut trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
     BuildTrace::Missing => panic!("expected .trace file"),
     BuildTrace::Bad => panic!("bad .trace file"),
-    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV3::from_hash(n, None)),
-    BuildTrace::V2(b) => (LtarVersion::V2, BuildTraceV3::from_hash(b.dep_hash.0, None)),
+    BuildTrace::V1(n) => (LtarVersion::V1, BuildTraceV3::from_hash(Some(n), None)),
+    BuildTrace::V2(b) => (LtarVersion::V2, BuildTraceV3::from_hash(Some(b.dep_hash.0), None)),
     BuildTrace::V3(mut b) => {
       b.log.retain(|it| it.level >= Level::Info);
       (LtarVersion::V3, b)
     }
   };
+  if !include_hash {
+    trace.dep_hash = None
+  }
+  if trace.dep_hash.is_none() && version < LtarVersion::V4 {
+    version = LtarVersion::V4
+  }
   tarfile.write_all(match version {
     LtarVersion::V1 => b"LTAR",
     LtarVersion::V2 => b"LTR2",
     LtarVersion::V3 => b"LTR3",
+    LtarVersion::V4 => b"LTR4",
   })?;
-  tarfile.write_u64::<LE>(trace.dep_hash.0)?;
+  if let Some(hash) = &trace.dep_hash {
+    if version >= LtarVersion::V4 {
+      tarfile.write_u8(1)?
+    }
+    tarfile.write_u64::<LE>(hash.0)?;
+  } else {
+    assert!(version >= LtarVersion::V4);
+    tarfile.write_u8(0)?;
+  }
   tarfile.write_all(trace_path.as_bytes())?;
   tarfile.write_u8(0)?;
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
   let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
   if version >= LtarVersion::V2 {
-    match trace.outputs {
-      None if trace.is_simple() => {
+    match (&trace.dep_hash, &trace.outputs) {
+      (Some(hash), None) if trace.is_simple() => {
         tarfile.write_u8(COMPRESSION_HASH_JSON)?;
-        tarfile.write_u64::<LE>(trace.dep_hash.0)?;
+        tarfile.write_u64::<LE>(hash.0)?;
       }
-      Some(Outputs::LeanModule(m)) if trace.is_simple() => {
-        tarfile.write_u8(COMPRESSION_HASH_OUTPUT)?;
-        tarfile.write_u64::<LE>(trace.dep_hash.0)?;
+      (hash, Some(Outputs::LeanModule(m))) if trace.is_simple() => {
+        if let Some(hash) = hash {
+          tarfile.write_u8(COMPRESSION_HASH_OUTPUT)?;
+          tarfile.write_u64::<LE>(hash.0)?;
+        } else {
+          tarfile.write_u8(COMPRESSION_HASH0_OUTPUT)?
+        }
         let mut oleans = m.olean.iter();
         tarfile.write_u64::<LE>(oleans.next().unwrap().hash.0)?;
         tarfile.write_u64::<LE>(m.ilean.hash.0)?;
