@@ -240,7 +240,7 @@ fn main() {
             fail()
           }
         } else {
-          eprintln!("{file}: {e}");
+          eprintln!("Unpacking {file} to {basedir}: {e}");
           fail()
         }
       }
