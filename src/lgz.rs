@@ -517,6 +517,7 @@ pub(crate) const TASK: u8 = 0x60;
 pub(crate) const REF: u8 = 0x70;
 pub(crate) const EXPRISH: u8 = 0x80;
 pub(crate) const PROMISE: u8 = 0x90;
+pub(crate) const SIZED_STRING: u8 = 0xa0;
 
 // only valid in exprish mode
 pub(crate) mod exprish {
@@ -1306,16 +1307,20 @@ impl<W: Write> LgzWriter<'_, W> {
         self.file.write_all(&self.buf[pos..][..size as usize]).unwrap();
       }
       tag::STRING => {
-        self.write_op(mode, LgzMode::Normal, STRING);
         let (size, pos) = parse_u64(self.buf, pos);
         let (_capacity, pos) = parse_u64(self.buf, pos);
         let (_length, pos) = parse_u64(self.buf, pos);
         let s = &self.buf[pos..][..size as usize];
         let s2 = std::ffi::CStr::from_bytes_until_nul(s).unwrap().to_bytes_with_nul();
-        // println!("string: {:?}", std::str::from_utf8(s2).unwrap());
-        // Internal nulls are not supported, unclear whether lean allows this
-        assert!(s2.len() == s.len());
-        self.file.write_all(s2).unwrap();
+        if s2.len() == s.len() {
+          self.write_op(mode, LgzMode::Normal, STRING);
+          self.file.write_all(s2).unwrap()
+        } else {
+          let content = s.strip_suffix(&[0]).expect("Lean string is not NUL-terminated");
+          self.write_op(mode, LgzMode::Normal, SIZED_STRING);
+          self.write_i64(LgzMode::Normal, content.len().try_into().unwrap());
+          self.file.write_all(content).unwrap()
+        }
       }
       tag::MPZ => {
         let (capacity, sign_size, pos) = if self.cfg.use_gmp {
@@ -1617,6 +1622,22 @@ impl<R: Read> LgzDecompressor<R> {
     self.write_u64(self.temp.len() as u64);
     self.write_u64(len);
     // println!("{:d$}string: {:?}", "", std::str::from_utf8(&self.temp).unwrap(), d = self.depth);
+    let (_, size2) = pad_to(self.temp.len(), 8);
+    self.temp.resize(size2, 0);
+    self.buf.append(&mut self.temp);
+    pos
+  }
+
+  fn write_sized_str(&mut self, byte_len: usize) -> u64 {
+    self.temp.resize(byte_len, 0);
+    self.file.read_exact(&mut self.temp).unwrap();
+    // UTF-8 continuation bytes have the form 10xxxxxx, so all other bytes begin characters.
+    let len = self.temp.iter().filter(|&&c| c & 0xC0 != 0x80).count();
+    self.temp.push(0);
+    let pos = self.write_header(tag::STRING, 1, 0);
+    self.write_u64(self.temp.len() as u64);
+    self.write_u64(self.temp.len() as u64);
+    self.write_u64(len as u64);
     let (_, size2) = pad_to(self.temp.len(), 8);
     self.temp.resize(size2, 0);
     self.buf.append(&mut self.temp);
@@ -1955,6 +1976,11 @@ impl<R: Read> LgzDecompressor<R> {
         self.copy(size as usize, size2);
       }
       STRING => pos = self.write_str(),
+      SIZED_STRING => {
+        let tag = self.file.read_u8().unwrap();
+        let byte_len = usize::try_from(self.read_i64(tag)).expect("invalid string byte length");
+        pos = self.write_sized_str(byte_len);
+      }
       MPZ => {
         let tag = self.file.read_u8().unwrap();
         let sign_size = self.read_i64(tag) as i32;
@@ -2021,5 +2047,75 @@ impl<R: Read> LgzDecompressor<R> {
     //   d = self.depth,
     // );
     pos
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::io::Cursor;
+
+  fn string_object(content: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Serialized Lean strings use cs_sz = 1 and have no object fields.
+    let header = ObjHeader { rc: 0.into(), cs_sz: 1.into(), num_fields: 0, tag: tag::STRING };
+    buf.extend_from_slice(header.as_bytes());
+    let size = content.len() as u64 + 1;
+    buf.write_u64::<LE>(size).unwrap();
+    buf.write_u64::<LE>(size).unwrap();
+    buf.write_u64::<LE>(std::str::from_utf8(content).unwrap().chars().count() as u64).unwrap();
+    buf.extend_from_slice(content);
+    buf.push(0);
+    buf.resize(buf.len().next_multiple_of(size_of::<u64>()), 0);
+    buf
+  }
+
+  fn roundtrip_string_object(content: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let object = string_object(content);
+    let offset = 1 << 16; // OLean object bases are aligned to 64 KiB.
+    let refs = [1]; // The root has one reference, so it does not need a SAVE opcode.
+    let mut compressed = Vec::new();
+    let mut writer = LgzWriter {
+      cfg: Config { use_gmp: false },
+      buf: &object,
+      file: WithPosition { r: &mut compressed, pos: 0 },
+      depth: 0,
+      offset,
+      refs: &refs,
+      backrefs: HashMap::new(),
+    };
+    writer.write_obj(offset, LgzMode::Normal);
+
+    let mut decompressor = LgzDecompressor {
+      cfg: Config { use_gmp: false },
+      buf: Vec::new(),
+      file: WithPosition { r: Cursor::new(&compressed), pos: 0 },
+      offset,
+      backrefs: Vec::new(),
+      stack: Vec::new(),
+      temp: Vec::new(),
+    };
+    assert_eq!(decompressor.write_obj(), offset);
+    assert_eq!(decompressor.file.pos, compressed.len());
+    assert_eq!(decompressor.buf, object);
+    (object, compressed)
+  }
+
+  #[test]
+  fn string_without_nul_keeps_terminated_encoding() {
+    let (_, compressed) = roundtrip_string_object(b"Lean");
+    assert_eq!(compressed, [STRING, b'L', b'e', b'a', b'n', 0]);
+  }
+
+  #[test]
+  fn string_with_nul_uses_sized_encoding() {
+    let content = b"a\0\xc3\xa9\0z";
+    let (object, compressed) = roundtrip_string_object(content);
+    let mut expected = vec![SIZED_STRING, UINT0 + content.len() as u8];
+    expected.extend_from_slice(content);
+    assert_eq!(compressed, expected);
+    let length_offset = size_of::<ObjHeader>() + 2 * size_of::<u64>();
+    let expected_length = std::str::from_utf8(content).unwrap().chars().count() as u64;
+    assert_eq!(parse_u64(&object, length_offset).0, expected_length);
   }
 }
