@@ -2049,3 +2049,73 @@ impl<R: Read> LgzDecompressor<R> {
     pos
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::io::Cursor;
+
+  fn string_object(content: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Serialized Lean strings use cs_sz = 1 and have no object fields.
+    let header = ObjHeader { rc: 0.into(), cs_sz: 1.into(), num_fields: 0, tag: tag::STRING };
+    buf.extend_from_slice(header.as_bytes());
+    let size = content.len() as u64 + 1;
+    buf.write_u64::<LE>(size).unwrap();
+    buf.write_u64::<LE>(size).unwrap();
+    buf.write_u64::<LE>(std::str::from_utf8(content).unwrap().chars().count() as u64).unwrap();
+    buf.extend_from_slice(content);
+    buf.push(0);
+    buf.resize(buf.len().next_multiple_of(size_of::<u64>()), 0);
+    buf
+  }
+
+  fn roundtrip_string_object(content: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let object = string_object(content);
+    let offset = 1 << 16; // OLean object bases are aligned to 64 KiB.
+    let refs = [1]; // The root has one reference, so it does not need a SAVE opcode.
+    let mut compressed = Vec::new();
+    let mut writer = LgzWriter {
+      cfg: Config { use_gmp: false },
+      buf: &object,
+      file: WithPosition { r: &mut compressed, pos: 0 },
+      depth: 0,
+      offset,
+      refs: &refs,
+      backrefs: HashMap::new(),
+    };
+    writer.write_obj(offset, LgzMode::Normal);
+
+    let mut decompressor = LgzDecompressor {
+      cfg: Config { use_gmp: false },
+      buf: Vec::new(),
+      file: WithPosition { r: Cursor::new(&compressed), pos: 0 },
+      offset,
+      backrefs: Vec::new(),
+      stack: Vec::new(),
+      temp: Vec::new(),
+    };
+    assert_eq!(decompressor.write_obj(), offset);
+    assert_eq!(decompressor.file.pos, compressed.len());
+    assert_eq!(decompressor.buf, object);
+    (object, compressed)
+  }
+
+  #[test]
+  fn string_without_nul_keeps_terminated_encoding() {
+    let (_, compressed) = roundtrip_string_object(b"Lean");
+    assert_eq!(compressed, [STRING, b'L', b'e', b'a', b'n', 0]);
+  }
+
+  #[test]
+  fn string_with_nul_uses_sized_encoding() {
+    let content = b"a\0\xc3\xa9\0z";
+    let (object, compressed) = roundtrip_string_object(content);
+    let mut expected = vec![SIZED_STRING, UINT0 + content.len() as u8];
+    expected.extend_from_slice(content);
+    assert_eq!(compressed, expected);
+    let length_offset = size_of::<ObjHeader>() + 2 * size_of::<u64>();
+    let expected_length = std::str::from_utf8(content).unwrap().chars().count() as u64;
+    assert_eq!(parse_u64(&object, length_offset).0, expected_length);
+  }
+}
