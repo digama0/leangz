@@ -1,4 +1,4 @@
-use crate::TempFile;
+use crate::{StagedFile, TempFile};
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -465,7 +465,7 @@ pub fn unpack<R: BufRead + Seek>(
     if version < LtarVersion::V2 {
       let mut file = TempFile::new(trace_path)?;
       write!(&mut file, "{trace}")?;
-      uncommitted.push(file);
+      uncommitted.push(file.stage());
     } else {
       let extra = read_extra(compression, &mut buf, &mut tarfile)?;
       unpack_one(
@@ -528,7 +528,7 @@ pub fn unpack<R: BufRead + Seek>(
 fn unpack_one<R: BufRead>(
   _version: LtarVersion, tarfile: &mut R, trace_override: Option<u64>, verbose: bool,
   path: PathBuf, compression: u8, extra: Vec<PathBuf>, buf: &mut Vec<u8>,
-  uncommitted: &mut Vec<TempFile>,
+  uncommitted: &mut Vec<StagedFile>,
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
 ) -> Result<(), UnpackError> {
   if verbose {
@@ -562,7 +562,7 @@ fn unpack_one<R: BufRead>(
       } else {
         std::io::copy(&mut { reader }, &mut *file)?;
       }
-      uncommitted.push(file);
+      uncommitted.push(file.stage());
     }
     COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
       buf.clear();
@@ -577,21 +577,21 @@ fn unpack_one<R: BufRead>(
       for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
         let mut file = TempFile::new(path)?;
         file.write_all(&buf[r])?;
-        uncommitted.push(file);
+        uncommitted.push(file.stage());
       }
     }
     COMPRESSION_HASH_PLAIN => {
       let mut file = TempFile::new(path)?;
       let trace = trace_override.unwrap_or(tarfile.read_u64::<LE>()?);
       write!(&mut file, "{trace}")?;
-      uncommitted.push(file);
+      uncommitted.push(file.stage());
     }
     COMPRESSION_HASH_JSON => {
       let trace = trace_override.unwrap_or(tarfile.read_u64::<LE>()?);
       let b = BuildTraceV2 { dep_hash: HashDec(trace) };
       let mut file = TempFile::new(path)?;
       file.write_all(&serde_json::to_vec(&b).unwrap())?;
-      uncommitted.push(file);
+      uncommitted.push(file.stage());
     }
     COMPRESSION_HASH_OUTPUT | COMPRESSION_HASH0_OUTPUT => {
       let hash =
@@ -638,7 +638,7 @@ fn unpack_one<R: BufRead>(
       let b = BuildTraceV3::from_hash(hash, Some(Outputs::LeanModule(m)));
       let mut file = TempFile::new(path)?;
       file.write_all(&serde_json::to_vec(&b).unwrap())?;
-      uncommitted.push(file);
+      uncommitted.push(file.stage());
     }
     compression => return Err(UnpackError::UnsupportedCompression(compression)),
   }
