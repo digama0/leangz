@@ -1948,7 +1948,7 @@ impl<R: Read> LgzDecompressor<R> {
       SCALAR_ARRAY => {
         let tag = self.file.read_u8().unwrap();
         let size = self.read_i64(tag) as u64;
-        pos = self.write_header(tag::SCALAR_ARRAY, 1, 0);
+        pos = self.write_header(tag::SCALAR_ARRAY, 1, 1);
         self.write_u64(size);
         self.write_u64(size);
         let (_, size2) = pad_to(size as usize, 8);

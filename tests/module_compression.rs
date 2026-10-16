@@ -114,3 +114,26 @@ fn test_single_olean_roundtrip() {
 
   println!("✓ Single .olean file matches perfectly");
 }
+
+/// `ScalarArray.olean` stores a `ByteArray` in an environment extension, so the
+/// `.olean` holds a scalar array object whose header records element size 1.
+#[test]
+fn test_scalar_array_roundtrip() {
+  let test_data_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/module");
+
+  let olean =
+    fs::read(format!("{}/ScalarArray.olean", test_data_dir)).expect("Failed to read .olean file");
+
+  let mut compressed = Vec::new();
+  leangz::lgz::compress(&[&olean], &mut compressed);
+
+  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1);
+
+  assert_eq!(ranges.len(), 1, "Expected 1 range for 1 file");
+
+  assert_eq!(
+    olean,
+    &decompressed_buf[ranges[0].clone()],
+    ".olean with a scalar array does not match after compression/decompression"
+  );
+}
