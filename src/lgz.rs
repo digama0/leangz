@@ -2018,6 +2018,7 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(value);
       }
       EXPRISH => pos = self.write_exprish(),
+      tag @ ..=0xcf if tag & 15 == 0 => panic!("unknown opcode {tag:#x}"),
       tag @ ..=0xcf => {
         let ctor = tag >> 4;
         let (num_fields, sfields) = unpack_ctor(tag);
