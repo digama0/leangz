@@ -413,8 +413,8 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
     tag::SCALAR_ARRAY => {
       let (size, pos) = parse_u64(buf, pos);
       let (capacity, pos) = parse_u64(buf, pos);
-      assert!(header.cs_sz.get() == 1 && header.num_fields == 1 && size == capacity);
-      pos + capacity as usize
+      assert!(header.cs_sz.get() == 1 && header.num_fields != 0 && size == capacity);
+      pos + header.num_fields as usize * capacity as usize
     }
     tag::STRING => {
       let (size, pos) = parse_u64(buf, pos);
@@ -515,7 +515,7 @@ pub(crate) const SAVE: u8 = 0xff;
 // only valid in normal mode
 pub(crate) const ARRAY: u8 = 0x00;
 pub(crate) const BIG_CTOR: u8 = 0x10;
-pub(crate) const SCALAR_ARRAY: u8 = 0x20;
+pub(crate) const BYTE_ARRAY: u8 = 0x20;
 pub(crate) const STRING: u8 = 0x30;
 pub(crate) const MPZ: u8 = 0x40;
 pub(crate) const THUNK: u8 = 0x50;
@@ -523,6 +523,7 @@ pub(crate) const TASK: u8 = 0x60;
 pub(crate) const REF: u8 = 0x70;
 pub(crate) const EXPRISH: u8 = 0x80;
 pub(crate) const PROMISE: u8 = 0x90;
+pub(crate) const SCALAR_ARRAY: u8 = 0xa0;
 
 // only valid in exprish mode
 pub(crate) mod exprish {
@@ -1305,11 +1306,17 @@ impl<W: Write> LgzWriter<'_, W> {
         }
       }
       tag::SCALAR_ARRAY => {
-        self.write_op(mode, LgzMode::Normal, SCALAR_ARRAY);
+        let elem_size = header.num_fields;
+        if elem_size == 1 {
+          self.write_op(mode, LgzMode::Normal, BYTE_ARRAY);
+        } else {
+          self.write_op(mode, LgzMode::Normal, SCALAR_ARRAY);
+          self.file.write_u8(elem_size).unwrap();
+        }
         let (size, pos) = parse_u64(self.buf, pos);
         self.write_i64(LgzMode::Normal, size.try_into().unwrap());
         let (_capacity, pos) = parse_u64(self.buf, pos);
-        self.file.write_all(&self.buf[pos..][..size as usize]).unwrap();
+        self.file.write_all(&self.buf[pos..][..elem_size as usize * size as usize]).unwrap();
       }
       tag::STRING => {
         self.write_op(mode, LgzMode::Normal, STRING);
@@ -1951,14 +1958,16 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(size);
         self.pop(start);
       }
-      SCALAR_ARRAY => {
+      BYTE_ARRAY | SCALAR_ARRAY => {
+        let elem_size = if tag == BYTE_ARRAY { 1 } else { self.file.read_u8().unwrap() };
         let tag = self.file.read_u8().unwrap();
         let size = self.read_i64(tag) as u64;
-        pos = self.write_header(tag::SCALAR_ARRAY, 1, 1);
+        pos = self.write_header(tag::SCALAR_ARRAY, 1, elem_size);
         self.write_u64(size);
         self.write_u64(size);
-        let (_, size2) = pad_to(size as usize, 8);
-        self.copy(size as usize, size2);
+        let bytes = elem_size as usize * size as usize;
+        let (_, size2) = pad_to(bytes, 8);
+        self.copy(bytes, size2);
       }
       STRING => pos = self.write_str(),
       MPZ => {

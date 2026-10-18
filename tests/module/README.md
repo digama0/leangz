@@ -35,6 +35,31 @@ open Lean
 run_cmd modifyEnv (bytesExt.addEntry · ⟨#[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]⟩)
 ```
 
+- `WideScalarArray.olean` - A module whose `.olean` holds two `FloatArray`s, i.e. scalar arrays with element size 8 (2.3K)
+
+`WideScalarArray.olean` was built with Lean 4.34.0 (`lean -o`) from two files, `WideScalarArrayExt.lean`:
+
+```lean
+import Lean
+open Lean
+
+initialize floatsExt : SimplePersistentEnvExtension FloatArray (Array FloatArray) ←
+  registerSimplePersistentEnvExtension {
+    addEntryFn := Array.push
+    addImportedFn := Array.flatten
+  }
+```
+
+and `WideScalarArray.lean`:
+
+```lean
+import WideScalarArrayExt
+open Lean
+
+run_cmd modifyEnv (floatsExt.addEntry · ⟨#[1.5]⟩)
+run_cmd modifyEnv (floatsExt.addEntry · ⟨#[1.5, 2.5, 3.5]⟩)
+```
+
 ## Running the Test
 
 ```bash
@@ -49,11 +74,12 @@ cargo test --test module_compression -- --nocapture
 
 ## Test Structure
 
-The test is located in `tests/module_compression.rs` and includes three tests:
+The test is located in `tests/module_compression.rs` and includes four tests:
 
 1. **`test_single_olean_roundtrip`** - Tests single file compression
 2. **`test_module_roundtrip`** - Tests module (3-file) compression
 3. **`test_scalar_array_roundtrip`** - Tests single file compression of an `.olean` holding a scalar array
+4. **`test_wide_scalar_array_roundtrip`** - Tests single file compression of an `.olean` holding scalar arrays with 8-byte elements
 
 ## Expected Behavior
 
