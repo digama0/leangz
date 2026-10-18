@@ -10,6 +10,46 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+/// Parses a JSON record's `base`: a string, or a list of strings or nulls.
+/// Entry `i` overrides basedir `i` (`-C`); null keeps it.
+fn parse_base(j: &serde_json::Map<String, serde_json::Value>) -> Vec<Option<PathBuf>> {
+  match j.get("base") {
+    None => vec![],
+    Some(b) => match b.as_array() {
+      Some(arr) => arr
+        .iter()
+        .map(|v| {
+          if v.is_null() {
+            None::<PathBuf>
+          } else {
+            Some(v.as_str().expect("expected string or null").into())
+          }
+        })
+        .collect(),
+      None => vec![Some(b.as_str().expect("expected string or array").into())],
+    },
+  }
+}
+
+/// `basedirs` with a record's `base` (see `parse_base`) applied.
+fn apply_base<'a>(
+  basedirs: &'a Vec<PathBuf>, base: &[Option<PathBuf>], file: &str,
+) -> Cow<'a, Vec<PathBuf>> {
+  let mut basedirs = Cow::Borrowed(basedirs);
+  for (i, basedir2) in base.iter().enumerate() {
+    if let Some(basedir2) = basedir2 {
+      let basedirs = basedirs.to_mut();
+      if let Some(b) = basedirs.get_mut(i) {
+        b.clone_from(basedir2)
+      } else {
+        assert_eq!(i, basedirs.len(), "{file}: missing basedir {}", basedirs.len());
+        basedirs.push(basedir2.clone())
+      }
+    }
+  }
+  basedirs
+}
+
 fn main() {
   let help = || {
     eprintln!(
@@ -32,6 +72,15 @@ fn main() {
       \n  Compress files FILE.trace and FILE ... into OUT.ltar\
       \n  * -c COMMENT will add a comment to the file which can be recovered using -k\
       \n\
+      \n* leantar [OPTS] -p -\
+      \n  Compress many archives, reading stdin as JSON: a list of records of the form\
+      \n      {{ out: string, trace: string, files?: [string], base?: string | [string] }}\
+      \n  each like `leantar [-C DIR ...] OUT.ltar FILE.trace FILE ...` (files take the\
+      \n  same -i and -c forms), packed in parallel (--jobs), preparing the dictionary\
+      \n  and compression contexts once per thread.\
+      \n    * base: overrides -C as for -x -j: entry i replaces the i-th -C directory\
+      \n      (null keeps it), and a string is a one-entry list\
+      \n\
       \n* leantar [OPTS] -k FILE.ltar\
       \n  Unpack comments in FILE.ltar\
       \n\
@@ -44,6 +93,8 @@ fn main() {
       \n\
       \ncompress opts:\
       \n  -s          Strip depHash from .ltar output\
+      \n  --level <N> zstd compression level (default: 19); unpacks the same\
+      \n  --jobs <N>  With -p, pack with N threads (default: num CPUs)\
       \n\
       \ndecompress opts:\
       \n  -f          Always unpack even if a matching trace file exists\
@@ -67,6 +118,9 @@ fn main() {
   let mut json_stdin = false;
   let mut delete_corrupted = false;
   let mut include_hash = true;
+  let mut do_pack_json = false;
+  let mut num_jobs: Option<usize> = None;
+  let mut level: Option<i32> = None;
   let mut basedirs = vec![];
   let mut args = std::env::args();
   args.next();
@@ -104,7 +158,7 @@ fn main() {
           .unwrap_or_else(|| help_err("--jobs missing argument"))
           .parse::<usize>()
           .unwrap();
-        ThreadPoolBuilder::new().num_threads(jobs).build_global().unwrap();
+        num_jobs = Some(jobs);
       }
       "-d" | "-x" => {
         do_decompress = true;
@@ -123,13 +177,87 @@ fn main() {
         include_hash = false;
         args.next();
       }
+      "-p" => {
+        do_pack_json = true;
+        args.next();
+      }
+      "--level" => {
+        args.next();
+        level = Some(
+          args
+            .next()
+            .unwrap_or_else(|| help_err("--level missing argument"))
+            .parse::<i32>()
+            .unwrap_or_else(|_| {
+              help_err("--level expects a number");
+              unreachable!()
+            }),
+        );
+      }
       _ => break,
     }
   }
+  // Packing recurses over an .olean's objects, deeper than a worker thread's
+  // default stack allows; the main thread, which packs a single archive, has
+  // the process's.
+  let mut pool = ThreadPoolBuilder::new();
+  if let Some(jobs) = num_jobs {
+    pool = pool.num_threads(jobs)
+  }
+  if do_pack_json {
+    pool = pool.stack_size(256 << 20)
+  }
+  pool.build_global().unwrap();
   if basedirs.is_empty() {
     basedirs.push(".".into())
   }
-  if do_show_comments {
+  if do_pack_json {
+    if args.next().as_deref() != Some("-") {
+      help_err("-p expects '-'");
+    }
+    let str = std::io::read_to_string(std::io::stdin()).unwrap();
+    let strings = |v: Option<&serde_json::Value>| -> Vec<String> {
+      v.map(|v| {
+        v.as_array()
+          .expect("expected array")
+          .iter()
+          .map(|s| s.as_str().expect("expected string").to_owned())
+          .collect()
+      })
+      .unwrap_or_default()
+    };
+    let jobs: Vec<_> = serde_json::from_str::<Vec<serde_json::Value>>(&str)
+      .unwrap()
+      .into_iter()
+      .map(|j| {
+        let j = j.as_object().expect("expected object");
+        let out = j["out"].as_str().expect("expected string").to_owned();
+        let trace = j["trace"].as_str().expect("expected string").to_owned();
+        let base = apply_base(&basedirs, &parse_base(j), &out).into_owned();
+        (out, trace, strings(j.get("files")), base)
+      })
+      .collect();
+    let error = AtomicBool::new(false);
+    jobs.into_par_iter().for_each_init(
+      || ltar::Compressors::new(level).unwrap(),
+      |comp, (out, trace, files, base)| {
+        if verbose {
+          println!("packing {out}");
+        }
+        let res = (|| -> io::Result<()> {
+          let mut temp = leangz::TempFile::new(out.clone().into())?;
+          ltar::pack_with(&base, BufWriter::new(&mut *temp), &trace, files, include_hash, verbose,
+            Some(comp))?;
+          temp.save().map(drop)
+        })();
+        if let Err(e) = res {
+          eprintln!("{out}: {e}");
+          error.store(true, std::sync::atomic::Ordering::Relaxed)
+        }
+      },
+    );
+    std::process::exit(error.into_inner() as i32);
+  } else if do_show_comments {
     let file = args.next().unwrap_or_else(|| help_err("expected FILE.ltar"));
     let tarfile = match File::open(&file) {
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -168,22 +296,7 @@ fn main() {
             } else {
               let j = j.as_object().expect("expected object");
               let file = j["file"].as_str().expect("expected string");
-              let base = match j.get("base") {
-                None => vec![],
-                Some(b) => match b.as_array() {
-                  Some(arr) => arr
-                    .iter()
-                    .map(|v| {
-                      if v.is_null() {
-                        None::<PathBuf>
-                      } else {
-                        Some(v.as_str().expect("expected string or null").into())
-                      }
-                    })
-                    .collect(),
-                  None => vec![Some(b.as_str().expect("expected string or array").into())],
-                },
-              };
+              let base = parse_base(j);
               let hash = j.get("hash").filter(|v| !v.is_null()).map(|value| {
                 value
                   .as_str()
@@ -209,18 +322,7 @@ fn main() {
       if verbose {
         println!("unpacking {file}");
       }
-      let mut basedirs = Cow::Borrowed(&basedirs);
-      for (i, basedir2) in base.iter().enumerate() {
-        if let Some(basedir2) = basedir2 {
-          let basedirs = basedirs.to_mut();
-          if let Some(b) = basedirs.get_mut(i) {
-            b.clone_from(basedir2)
-          } else {
-            assert_eq!(i, basedirs.len(), "{file}: missing basedir {}", basedirs.len());
-            basedirs.push(basedir2.clone())
-          }
-        }
-      }
+      let basedirs = apply_base(&basedirs, &base, &file);
       let tarfile = match File::open(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
           eprintln!("{file} not found");
@@ -250,8 +352,10 @@ fn main() {
     let tarfile = args.next().unwrap_or_else(|| help_err("expected OUT.ltar"));
     let trace_path = args.next().unwrap_or_else(|| help_err("expected FILE.trace"));
     let mut temp = leangz::TempFile::new(tarfile.into()).unwrap();
-    ltar::pack(&basedirs, BufWriter::new(&mut *temp), &trace_path, args, include_hash, verbose)
-      .unwrap();
+    let mut comp = level.map(|level| ltar::Compressors::new(Some(level)).unwrap());
+    ltar::pack_with(&basedirs, BufWriter::new(&mut *temp), &trace_path, args, include_hash, verbose,
+      comp.as_mut())
+    .unwrap();
     temp.save().unwrap();
   }
 }
