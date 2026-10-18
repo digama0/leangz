@@ -413,13 +413,13 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
     tag::SCALAR_ARRAY => {
       let (size, pos) = parse_u64(buf, pos);
       let (capacity, pos) = parse_u64(buf, pos);
-      assert!(header.cs_sz.get() == 1 && size == capacity);
+      assert!(header.cs_sz.get() == 1 && header.num_fields == 1 && size == capacity);
       pos + capacity as usize
     }
     tag::STRING => {
       let (size, pos) = parse_u64(buf, pos);
       let (capacity, pos) = parse_u64(buf, pos);
-      assert!(header.cs_sz.get() == 1 && size == capacity);
+      assert!(header.cs_sz.get() == 1 && header.num_fields == 0 && size == capacity);
       let (_length, pos) = parse_u64(buf, pos);
       pos + capacity as usize
     }
@@ -429,6 +429,7 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
         let (size, pos) = parse_i32(buf, pos);
         assert!(
           header.cs_sz.get() == ((capacity + 3) as u16) << 3
+            && header.num_fields == 0
             && size.unsigned_abs() == capacity
             && capacity != 0
         );
@@ -437,20 +438,25 @@ fn on_subobjs(cfg: Config, buf: &[u8], pos0: usize, mut f: impl FnMut(u64)) -> u
       } else {
         let (sign, pos) = parse_u64(buf, pos);
         let (size, pos) = parse_u64(buf, pos);
-        assert!(header.cs_sz.get() == ((size + 8) as u16) << 2 && sign < 2 && size != 0);
+        assert!(
+          header.cs_sz.get() == ((size + 8) as u16) << 2
+            && header.num_fields == 0
+            && sign < 2
+            && size != 0
+        );
         let (_limbs_ptr, pos) = parse_u64(buf, pos);
         pos + (4 * size) as usize
       },
     tag::THUNK | tag::TASK => {
       let (value, pos) = parse_u64(buf, pos);
       let (imp, pos) = parse_u64(buf, pos);
-      assert!(header.cs_sz.get() == 3 << 3 && imp == 0);
+      assert!(header.cs_sz.get() == 3 << 3 && header.num_fields == 0 && imp == 0);
       on_leanobj!(f, value);
       pos
     }
     tag::REF | tag::PROMISE => {
       let (value, pos) = parse_u64(buf, pos);
-      assert!(header.cs_sz.get() == 2 << 3);
+      assert!(header.cs_sz.get() == 2 << 3 && header.num_fields == 0);
       on_leanobj!(f, value);
       pos
     }
