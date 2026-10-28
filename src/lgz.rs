@@ -1973,7 +1973,7 @@ impl<R: Read> LgzDecompressor<R> {
       MPZ => {
         let tag = self.file.read_u8().unwrap();
         let sign_size = self.read_i64(tag) as i32;
-        let capacity = sign_size as u32 & 0x7FFFFFFF;
+        let capacity = sign_size.unsigned_abs();
         let size = (capacity as usize) << 3;
         if self.cfg.use_gmp {
           pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
