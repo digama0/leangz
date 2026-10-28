@@ -524,6 +524,7 @@ pub(crate) const REF: u8 = 0x70;
 pub(crate) const EXPRISH: u8 = 0x80;
 pub(crate) const PROMISE: u8 = 0x90;
 pub(crate) const SCALAR_ARRAY: u8 = 0xa0;
+pub(crate) const SIZED_STRING: u8 = 0xb0;
 
 // only valid in exprish mode
 pub(crate) mod exprish {
@@ -1319,16 +1320,21 @@ impl<W: Write> LgzWriter<'_, W> {
         self.file.write_all(&self.buf[pos..][..elem_size as usize * size as usize]).unwrap();
       }
       tag::STRING => {
-        self.write_op(mode, LgzMode::Normal, STRING);
         let (size, pos) = parse_u64(self.buf, pos);
         let (_capacity, pos) = parse_u64(self.buf, pos);
         let (_length, pos) = parse_u64(self.buf, pos);
         let s = &self.buf[pos..][..size as usize];
-        let s2 = std::ffi::CStr::from_bytes_until_nul(s).unwrap().to_bytes_with_nul();
-        // println!("string: {:?}", std::str::from_utf8(s2).unwrap());
-        // Internal nulls are not supported, unclear whether lean allows this
-        assert!(s2.len() == s.len());
-        self.file.write_all(s2).unwrap();
+        let Some((0, chars)) = s.split_last() else { panic!("string is not NUL-terminated") };
+        // println!("string: {:?}", std::str::from_utf8(chars).unwrap());
+        if chars.contains(&0) {
+          // Lean strings can contain NUL (U+0000), which STRING cannot represent
+          self.write_op(mode, LgzMode::Normal, SIZED_STRING);
+          self.write_i64(LgzMode::Normal, chars.len().try_into().unwrap());
+          self.file.write_all(chars).unwrap();
+        } else {
+          self.write_op(mode, LgzMode::Normal, STRING);
+          self.file.write_all(s).unwrap();
+        }
       }
       tag::MPZ => {
         let (capacity, sign_size, pos) = if self.cfg.use_gmp {
@@ -1625,6 +1631,23 @@ impl<R: Read> LgzDecompressor<R> {
         len += 1;
       }
     }
+    self.write_str_obj(len)
+  }
+
+  fn write_sized_str(&mut self) -> u64 {
+    let tag = self.file.read_u8().unwrap();
+    let size = self.read_i64(tag) as u64;
+    self.temp.clear();
+    (&mut self.file).take(size).read_to_end(&mut self.temp).unwrap();
+    assert!(self.temp.len() as u64 == size, "unexpected end of string");
+    let len = self.temp.iter().filter(|&&c| c & 0xC0 != 0x80).count();
+    self.temp.push(0);
+    self.write_str_obj(len as u64)
+  }
+
+  /// Writes a string object of `len` characters whose bytes, including the
+  /// terminating NUL, are in `self.temp`.
+  fn write_str_obj(&mut self, len: u64) -> u64 {
     let pos = self.write_header(tag::STRING, 1, 0);
     self.write_u64(self.temp.len() as u64);
     self.write_u64(self.temp.len() as u64);
@@ -1970,6 +1993,7 @@ impl<R: Read> LgzDecompressor<R> {
         self.copy(bytes, size2);
       }
       STRING => pos = self.write_str(),
+      SIZED_STRING => pos = self.write_sized_str(),
       MPZ => {
         let tag = self.file.read_u8().unwrap();
         let sign_size = self.read_i64(tag) as i32;
