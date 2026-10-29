@@ -1636,10 +1636,9 @@ impl<R: Read> LgzDecompressor<R> {
 
   fn write_sized_str(&mut self) -> u64 {
     let tag = self.file.read_u8().unwrap();
-    let size = self.read_i64(tag) as u64;
-    self.temp.clear();
-    (&mut self.file).take(size).read_to_end(&mut self.temp).unwrap();
-    assert!(self.temp.len() as u64 == size, "unexpected end of string");
+    let size = self.read_i64(tag) as usize;
+    self.temp.resize(size, 0);
+    self.file.read_exact(&mut self.temp).unwrap();
     let len = self.temp.iter().filter(|&&c| c & 0xC0 != 0x80).count();
     self.temp.push(0);
     self.write_str_obj(len as u64)
