@@ -870,7 +870,9 @@ pub fn pack(
       if mmap.len() > 20 {
         return None
       }
-      std::str::from_utf8(&mmap).ok()?.parse::<u64>().ok()
+      let n = std::str::from_utf8(&mmap).ok()?.parse::<u64>().ok()?;
+      // Unpacking writes n back in decimal, so store it only if that gives back these bytes.
+      (n.to_string().as_bytes() == &mmap[..]).then_some(n)
     })() {
       tarfile.write_u8(COMPRESSION_HASH_PLAIN)?;
       tarfile.write_u64::<LE>(n)?;
