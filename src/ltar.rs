@@ -14,6 +14,53 @@ const COMPRESSION_LEVEL: i32 = 19;
 #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
 
+/// Reusable compression contexts for packing many archives: the dictionary is
+/// prepared once per process, and each context is reset between files rather
+/// than allocated again. Compressing whole buffers also tells zstd each input's
+/// size, so small files get small tables.
+#[cfg(feature = "zstd")]
+pub struct Compressors {
+  #[cfg(feature = "zstd-dict")]
+  dict: zstd::bulk::Compressor<'static>,
+  plain: zstd::bulk::Compressor<'static>,
+}
+
+/// The dictionary prepared for each compression level used, once per process.
+#[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+fn dict_v1_enc(level: i32) -> &'static zstd::dict::EncoderDictionary<'static> {
+  use std::collections::HashMap;
+  use std::sync::Mutex;
+  static DICTS: Mutex<Option<HashMap<i32, &'static zstd::dict::EncoderDictionary<'static>>>> =
+    Mutex::new(None);
+  let mut dicts = DICTS.lock().unwrap();
+  *dicts.get_or_insert_with(HashMap::new).entry(level).or_insert_with(|| {
+    Box::leak(Box::new(zstd::dict::EncoderDictionary::copy(DICT_V1, level)))
+  })
+}
+
+#[cfg(feature = "zstd")]
+impl Compressors {
+  /// Compressors at zstd level `level` (`None`: the default, 19). Any level
+  /// unpacks the same way.
+  pub fn new(level: Option<i32>) -> io::Result<Self> {
+    let level = level.unwrap_or(COMPRESSION_LEVEL);
+    Ok(Compressors {
+      #[cfg(feature = "zstd-dict")]
+      dict: zstd::bulk::Compressor::with_prepared_dictionary(dict_v1_enc(level))?,
+      plain: zstd::bulk::Compressor::new(level)?,
+    })
+  }
+}
+
+#[cfg(not(feature = "zstd"))]
+pub struct Compressors;
+
+#[cfg(not(feature = "zstd"))]
+impl Compressors {
+  /// Without zstd there is nothing to compress with: these do nothing.
+  pub fn new(_level: Option<i32>) -> io::Result<Self> { Ok(Compressors) }
+}
+
 const COMPRESSION_ZSTD: u8 = 0;
 const COMPRESSION_LGZ: u8 = 1;
 const COMPRESSION_HASH_PLAIN: u8 = 2;
@@ -681,8 +728,17 @@ fn skip_one<R: BufRead + Seek>(
 }
 
 pub fn pack(
+  basedirs: &[PathBuf], tarfile: impl Write, trace_path: &str,
+  args: impl IntoIterator<Item = String>, include_hash: bool, verbose: bool,
+) -> io::Result<()> {
+  pack_with(basedirs, tarfile, trace_path, args, include_hash, verbose, None)
+}
+
+/// `pack`, compressing with `comp` if given (see `Compressors`).
+pub fn pack_with(
   basedirs: &[PathBuf], mut tarfile: impl Write, trace_path: &str,
   args: impl IntoIterator<Item = String>, include_hash: bool, verbose: bool,
+  mut comp: Option<&mut Compressors>,
 ) -> io::Result<()> {
   let (mut version, mut trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
     BuildTrace::Missing => panic!("expected .trace file"),
@@ -718,7 +774,11 @@ pub fn pack(
   tarfile.write_all(trace_path.as_bytes())?;
   tarfile.write_u8(0)?;
   #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-  let dict_v1 = zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL);
+  let dict_v1 = if comp.is_none() {
+    Some(zstd::dict::EncoderDictionary::copy(DICT_V1, COMPRESSION_LEVEL))
+  } else {
+    None
+  };
   if version >= LtarVersion::V2 {
     match (&trace.dep_hash, &trace.outputs) {
       (Some(hash), None) if trace.is_simple() => {
@@ -763,7 +823,7 @@ pub fn pack(
         }
         tarfile.write_u8(OUTPUT_HASH_END)?;
       }
-      _ => pack_zstd(&serde_json::to_vec(&trace)?, &mut tarfile)?,
+      _ => pack_zstd(&serde_json::to_vec(&trace)?, &mut tarfile, comp.as_deref_mut())?,
     };
   }
 
@@ -853,11 +913,23 @@ pub fn pack(
       } else {
         &[&mmap]
       };
-      #[cfg(feature = "zstd")]
-      {
-        #[cfg(feature = "zstd-dict")]
-        let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
-        #[cfg(not(feature = "zstd-dict"))]
+      #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
+      if let Some(comp) = comp.as_deref_mut() {
+        let mut raw = vec![];
+        lgz::compress(mmaps, &mut raw);
+        buf = comp.dict.compress(&raw)?;
+      } else {
+        let mut enc =
+          zstd::stream::Encoder::with_prepared_dictionary(&mut buf, dict_v1.as_ref().unwrap())?;
+        lgz::compress(mmaps, &mut enc);
+        enc.finish()?;
+      }
+      #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
+      if let Some(comp) = comp.as_deref_mut() {
+        let mut raw = vec![];
+        lgz::compress(mmaps, &mut raw);
+        buf = comp.plain.compress(&raw)?;
+      } else {
         let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
         lgz::compress(mmaps, &mut enc);
         enc.finish()?;
@@ -875,15 +947,23 @@ pub fn pack(
       tarfile.write_u8(COMPRESSION_HASH_PLAIN)?;
       tarfile.write_u64::<LE>(n)?;
     } else {
-      pack_zstd(&mmap, &mut tarfile)?;
+      pack_zstd(&mmap, &mut tarfile, comp.as_deref_mut())?;
     }
   }
   Ok(())
 }
 
-fn pack_zstd(data: &[u8], tarfile: &mut impl Write) -> io::Result<()> {
+#[cfg_attr(not(feature = "zstd"), allow(unused_variables))]
+fn pack_zstd(data: &[u8], tarfile: &mut impl Write, comp: Option<&mut Compressors>) -> io::Result<()> {
   tarfile.write_u8(COMPRESSION_ZSTD)?;
   let mut buf = vec![];
+  #[cfg(feature = "zstd")]
+  if let Some(comp) = comp {
+    buf = comp.plain.compress(data)?;
+    tarfile.write_u64::<LE>(buf.len() as u64)?;
+    tarfile.write_all(&buf)?;
+    return Ok(())
+  }
   #[cfg(feature = "zstd")]
   {
     let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
