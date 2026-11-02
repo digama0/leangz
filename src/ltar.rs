@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead, ErrorKind, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::lgz;
 
@@ -29,6 +29,7 @@ pub enum UnpackError {
   NotEnoughPaths(u8),
   UnsupportedCompression(u8),
   MissingHash,
+  UnsafePath(String),
 }
 
 impl std::fmt::Display for UnpackError {
@@ -43,6 +44,7 @@ impl std::fmt::Display for UnpackError {
         f,
         "this .ltar was packed with -s (no depHash); an override hash must be supplied to unpack it"
       ),
+      UnpackError::UnsafePath(path) => write!(f, "path leaves the target directory: {path}"),
     }
   }
 }
@@ -356,6 +358,20 @@ fn read_trace_file(trace_path: &Path) -> Result<BuildTrace, io::Error> {
   })
 }
 
+/// Whether `path`, a file name stored in an .ltar file, stays inside the
+/// directory it is joined to: it must be relative, without a root, a drive or
+/// other prefix, or a `..` component, on any platform, so both `/` and `\`
+/// count as separators.  It must also end in a file name: `Path` drops a
+/// trailing `.` or separator, so the parent of `base/.` is not `base`.
+fn is_safe_relative_path(path: &str) -> bool {
+  let mut parts = path.split(['/', '\\']);
+  !path.starts_with(['/', '\\'])
+    && !matches!(path.rsplit(['/', '\\']).next(), Some("" | "."))
+    && !parts.next().is_some_and(|first| first.contains(':') || first == "..")
+    && !parts.any(|part| part == "..")
+    && Path::new(path).components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 fn get_version<R: BufRead>(tarfile: &mut R) -> Result<LtarVersion, UnpackError> {
   let mut buf = [0; 4];
   tarfile.read_exact(&mut buf)?;
@@ -412,12 +428,15 @@ pub fn unpack<R: BufRead + Seek>(
     };
     Ok(match read_cstr(buf, tarfile)? {
       true if buf.is_empty() => Some(None),
-      true => Some(Some(
-        basedir
-          .get(pathidx as usize)
-          .ok_or(UnpackError::NotEnoughPaths(pathidx))?
-          .join(std::str::from_utf8(buf)?),
-      )),
+      true => {
+        let path = std::str::from_utf8(buf)?;
+        if !is_safe_relative_path(path) {
+          return Err(UnpackError::UnsafePath(path.into()))
+        }
+        Some(Some(
+          basedir.get(pathidx as usize).ok_or(UnpackError::NotEnoughPaths(pathidx))?.join(path),
+        ))
+      }
       false => None,
     })
   };
@@ -684,6 +703,17 @@ pub fn pack(
   basedirs: &[PathBuf], mut tarfile: impl Write, trace_path: &str,
   args: impl IntoIterator<Item = String>, include_hash: bool, verbose: bool,
 ) -> io::Result<()> {
+  let check_path = |path: &str| {
+    if is_safe_relative_path(path) {
+      Ok(())
+    } else {
+      Err(io::Error::new(
+        ErrorKind::InvalidInput,
+        format!("path leaves the base directory: {path}"),
+      ))
+    }
+  };
+  check_path(trace_path)?;
   let (mut version, mut trace) = match read_trace_file(&basedirs[0].join(trace_path))? {
     BuildTrace::Missing => panic!("expected .trace file"),
     BuildTrace::Bad => panic!("bad .trace file"),
@@ -784,6 +814,7 @@ pub fn pack(
       idx = it.next().expect("expected index argument").parse().expect("expected number");
       file = it.next().expect("expected file");
     }
+    check_path(&file)?;
     let module = file.ends_with(".olean.private")
       && (|| {
         let mut it = new_args.iter();
