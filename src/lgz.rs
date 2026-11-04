@@ -282,10 +282,12 @@ pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
     cfg,
     file: WithPosition { r: outfile, pos: 0 },
     refs: &refs,
+    budget: refs.len(),
     offset,
     backrefs: Default::default(),
     buf: rest,
-    depth: 0,
+    // depth: 0,
+    tasks: vec![],
   };
   let mut new_buf;
   if !cont.is_empty() {
@@ -486,10 +488,29 @@ struct LgzWriter<'a, W> {
   cfg: Config,
   buf: &'a [u8],
   file: WithPosition<W>,
-  depth: usize,
+  // depth: usize,
   offset: u64,
   refs: &'a [u8],
   backrefs: HashMap<u64, u32>,
+  /// What remains to be written, the next step last.
+  tasks: Vec<Task>,
+  /// How many more objects there is room for; see `write_one`.
+  budget: usize,
+}
+
+/// A step of `LgzWriter::write_obj`.  Objects can point to each other in
+/// chains as long as the data, such as the cells of a linked list, so the
+/// writer keeps the objects it has yet to write on an explicit stack of
+/// these instead of recursing, which would overflow the call stack.
+enum Task {
+  /// Write the object `ptr` (or the scalar, if `ptr` is one) in the mode.
+  Obj(u64, LgzMode),
+  /// Write the `n` object pointers at `pos` in the buffer, in normal mode.
+  Fields(usize, u64),
+  /// Copy `len` bytes at `pos` in the buffer.
+  Raw(usize, usize),
+  /// Record the backref of `ptr`, whose encoding is now complete.
+  Save(u64),
 }
 
 pub const NAME_ANON_HASH: u64 = 1723;
@@ -836,6 +857,10 @@ fn get_lit_hash(cfg: Config, buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
     return None
   }
   let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+  if header.num_fields == 0 {
+    // not a `Literal`, and there is no field to read
+    return None
+  }
   match header.tag {
     0 => get_num_hash(cfg, buf, offset, parse_u64(buf, pos).0),
     1 => get_str_hash(buf, offset, parse_u64(buf, pos).0),
@@ -847,18 +872,21 @@ fn get_list_level_data(buf: &[u8], offset: u64, mut ptr: u64) -> (u64, u8) {
   let (mut hash, mut bits) = (7, 0);
   while ptr & 1 == 0 {
     let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
-    if header.tag != 1 {
+    if header.tag != 1 || header.num_fields < 2 {
       break
     }
-    if header.num_fields >= 2 {
-      let (ptr1, pos) = parse_u64(buf, pos);
-      let (ptr2, _) = parse_u64(buf, pos);
-      let Some(data) = get_level_data(buf, offset, ptr1) else { break };
-      let (h1, _, bits1) = exprish::unpack_level_data(data);
-      hash = mix_hash(hash, h1 as u64);
-      bits |= bits1;
-      ptr = ptr2
+    let (ptr1, pos) = parse_u64(buf, pos);
+    let (ptr2, _) = parse_u64(buf, pos);
+    if ptr2 >= ptr {
+      // Lean writes an object after the objects it points to, so the tail
+      // of a list comes before it; stop rather than go round a cycle
+      break
     }
+    let Some(data) = get_level_data(buf, offset, ptr1) else { break };
+    let (h1, _, bits1) = exprish::unpack_level_data(data);
+    hash = mix_hash(hash, h1 as u64);
+    bits |= bits1;
+    ptr = ptr2
   }
   (hash, bits)
 }
@@ -934,10 +962,10 @@ impl<W: Write> LgzWriter<'_, W> {
           let (hash2, bits2) = get_list_level_data(self.buf, self.offset, ptr2);
           if exprish::expr_const_data(hash1, hash2, bits2) == parse_u64(self.buf, pos).0 {
             self.write_op(mode, LgzMode::Exprish, exprish::EXPR_CONST_APP + stack.len() as u8);
-            self.write_obj(ptr1, LgzMode::Exprish);
-            self.write_obj(ptr2, LgzMode::Normal);
+            self.defer(Task::Obj(ptr1, LgzMode::Exprish));
+            self.defer(Task::Obj(ptr2, LgzMode::Normal));
             for ptr2 in stack.into_iter().rev() {
-              self.write_obj(ptr2, LgzMode::Exprish);
+              self.defer(Task::Obj(ptr2, LgzMode::Exprish));
             }
             return Some(())
           }
@@ -979,9 +1007,9 @@ impl<W: Write> LgzWriter<'_, W> {
     let ptr = ptr?;
     debug_assert!(!stack.is_empty());
     self.write_op(mode, LgzMode::Exprish, exprish::EXPR_APP + stack.len() as u8);
-    self.write_obj(ptr, LgzMode::Exprish);
+    self.defer(Task::Obj(ptr, LgzMode::Exprish));
     for ptr2 in stack.into_iter().rev() {
-      self.write_obj(ptr2, LgzMode::Exprish);
+      self.defer(Task::Obj(ptr2, LgzMode::Exprish));
     }
     Some(())
   }
@@ -1001,8 +1029,8 @@ impl<W: Write> LgzWriter<'_, W> {
         let h2 = get_str_hash(self.buf, self.offset, ptr2)?;
         if mix_hash(h1, h2) == parse_u64(self.buf, pos).0 {
           self.write_op(mode, LgzMode::Exprish, exprish::NAME_STR);
-          self.write_obj(ptr1, LgzMode::Exprish);
-          self.write_obj(ptr2, LgzMode::Normal);
+          self.defer(Task::Obj(ptr1, LgzMode::Exprish));
+          self.defer(Task::Obj(ptr2, LgzMode::Normal));
           return Some(())
         }
         #[cfg(feature = "debug")]
@@ -1026,7 +1054,7 @@ impl<W: Write> LgzWriter<'_, W> {
             == parse_u64(self.buf, pos).0
           {
             self.write_op(mode, LgzMode::Exprish, exprish::LEVEL_SUCC);
-            self.write_obj(ptr, LgzMode::Exprish);
+            self.defer(Task::Obj(ptr, LgzMode::Exprish));
             return Some(())
           }
           None
@@ -1036,7 +1064,7 @@ impl<W: Write> LgzWriter<'_, W> {
           let hash = get_name_hash(self.buf, self.offset, ptr)?;
           if exprish::expr_fvar_data(hash) == parse_u64(self.buf, pos).0 {
             self.write_op(mode, LgzMode::Exprish, exprish::EXPR_FVAR);
-            self.write_obj(ptr, LgzMode::Exprish);
+            self.defer(Task::Obj(ptr, LgzMode::Exprish));
             return Some(())
           }
           #[cfg(feature = "debug")]
@@ -1064,8 +1092,8 @@ impl<W: Write> LgzWriter<'_, W> {
           ) == parse_u64(self.buf, pos).0
           {
             self.write_op(mode, LgzMode::Exprish, exprish::LEVEL_MAX);
-            self.write_obj(ptr1, LgzMode::Exprish);
-            self.write_obj(ptr2, LgzMode::Exprish);
+            self.defer(Task::Obj(ptr1, LgzMode::Exprish));
+            self.defer(Task::Obj(ptr2, LgzMode::Exprish));
             return Some(())
           }
           None
@@ -1076,8 +1104,8 @@ impl<W: Write> LgzWriter<'_, W> {
           let h2 = if ptr2 & 1 == 1 { ptr2 >> 1 } else { 17 };
           if mix_hash(h1, h2) == parse_u64(self.buf, pos).0 {
             self.write_op(mode, LgzMode::Exprish, exprish::NAME_NUM);
-            self.write_obj(ptr1, LgzMode::Exprish);
-            self.write_obj(ptr2, LgzMode::Normal);
+            self.defer(Task::Obj(ptr1, LgzMode::Exprish));
+            self.defer(Task::Obj(ptr2, LgzMode::Normal));
             return Some(())
           }
           None
@@ -1093,8 +1121,8 @@ impl<W: Write> LgzWriter<'_, W> {
         ) == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::LEVEL_IMAX);
-          self.write_obj(ptr1, LgzMode::Exprish);
-          self.write_obj(ptr2, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr1, LgzMode::Exprish));
+          self.defer(Task::Obj(ptr2, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1105,7 +1133,7 @@ impl<W: Write> LgzWriter<'_, W> {
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::LEVEL_PARAM);
-          self.write_obj(ptr, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1116,7 +1144,7 @@ impl<W: Write> LgzWriter<'_, W> {
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::LEVEL_MVAR);
-          self.write_obj(ptr, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1128,7 +1156,7 @@ impl<W: Write> LgzWriter<'_, W> {
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_BVAR);
-          self.write_obj(ptr, LgzMode::Normal);
+          self.defer(Task::Obj(ptr, LgzMode::Normal));
           return Some(())
         }
       }
@@ -1139,7 +1167,7 @@ impl<W: Write> LgzWriter<'_, W> {
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_MVAR);
-          self.write_obj(ptr, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1150,7 +1178,7 @@ impl<W: Write> LgzWriter<'_, W> {
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_SORT);
-          self.write_obj(ptr, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1168,9 +1196,9 @@ impl<W: Write> LgzWriter<'_, W> {
         let data2 = get_expr_data(self.buf, self.offset, body)?;
         if exprish::expr_binder_data(data1, data2) == data && bi & !3 == 0 {
           self.write_op(mode, LgzMode::Exprish, (ctor << 2) + bi as u8);
-          self.write_obj(name, LgzMode::Exprish);
-          self.write_obj(ty, LgzMode::Exprish);
-          self.write_obj(body, LgzMode::Exprish);
+          self.defer(Task::Obj(name, LgzMode::Exprish));
+          self.defer(Task::Obj(ty, LgzMode::Exprish));
+          self.defer(Task::Obj(body, LgzMode::Exprish));
           return Some(())
         }
         #[cfg(feature = "debug")]
@@ -1195,10 +1223,10 @@ impl<W: Write> LgzWriter<'_, W> {
           && non_dep & !1 == 0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_LET + non_dep as u8);
-          self.write_obj(name, LgzMode::Exprish);
-          self.write_obj(ty, LgzMode::Exprish);
-          self.write_obj(value, LgzMode::Exprish);
-          self.write_obj(body, LgzMode::Exprish);
+          self.defer(Task::Obj(name, LgzMode::Exprish));
+          self.defer(Task::Obj(ty, LgzMode::Exprish));
+          self.defer(Task::Obj(value, LgzMode::Exprish));
+          self.defer(Task::Obj(body, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1209,7 +1237,7 @@ impl<W: Write> LgzWriter<'_, W> {
         let hash = get_lit_hash(self.cfg, self.buf, self.offset, ptr)?;
         if exprish::expr_lit_data(hash) == parse_u64(self.buf, pos).0 {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_LIT);
-          self.write_obj(ptr, LgzMode::Normal);
+          self.defer(Task::Obj(ptr, LgzMode::Normal));
           return Some(())
         }
         #[cfg(feature = "debug")]
@@ -1227,8 +1255,8 @@ impl<W: Write> LgzWriter<'_, W> {
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_MDATA);
-          self.write_obj(ptr1, LgzMode::Normal);
-          self.write_obj(ptr2, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr1, LgzMode::Normal));
+          self.defer(Task::Obj(ptr2, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1244,9 +1272,9 @@ impl<W: Write> LgzWriter<'_, W> {
         ) == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_PROJ);
-          self.write_obj(ptr1, LgzMode::Exprish);
-          self.write_obj(ptr2, LgzMode::Normal);
-          self.write_obj(ptr3, LgzMode::Exprish);
+          self.defer(Task::Obj(ptr1, LgzMode::Exprish));
+          self.defer(Task::Obj(ptr2, LgzMode::Normal));
+          self.defer(Task::Obj(ptr3, LgzMode::Exprish));
           return Some(())
         }
       }
@@ -1269,6 +1297,40 @@ impl<W: Write> LgzWriter<'_, W> {
   }
 
   fn write_obj(&mut self, ptr: u64, mode: LgzMode) {
+    debug_assert!(self.tasks.is_empty());
+    self.start(ptr, mode);
+    while let Some(task) = self.tasks.pop() {
+      match task {
+        Task::Obj(ptr, mode) => self.start(ptr, mode),
+        Task::Fields(pos, n) => {
+          let (ptr, pos2) = parse_u64(self.buf, pos);
+          if n > 1 {
+            self.tasks.push(Task::Fields(pos2, n - 1));
+          }
+          self.start(ptr, LgzMode::Normal)
+        }
+        Task::Raw(pos, len) => self.file.write_all(&self.buf[pos..][..len]).unwrap(),
+        Task::Save(ptr) => {
+          self.backrefs.insert(ptr, self.backrefs.len().try_into().unwrap());
+        }
+      }
+    }
+  }
+
+  /// Writes the object `ptr` up to its first field and puts the rest on the
+  /// stack of tasks.
+  fn start(&mut self, ptr: u64, mode: LgzMode) {
+    let mark = self.tasks.len();
+    self.write_one(ptr, mode);
+    self.tasks[mark..].reverse();
+  }
+
+  /// Leaves `task` for after the tasks that `write_one` has already left.
+  fn defer(&mut self, task: Task) { self.tasks.push(task) }
+
+  /// Writes the object `ptr` up to its first field and defers the rest, in
+  /// order.
+  fn write_one(&mut self, ptr: u64, mode: LgzMode) {
     if ptr & 1 == 1 {
       self.write_i64(mode, ptr as i64 >> 1);
       return
@@ -1277,11 +1339,18 @@ impl<W: Write> LgzWriter<'_, W> {
       self.write_backref(mode, i);
       return
     }
+    // Every object is written once, and written again only as a backref,
+    // unless it points back to itself through its fields, which Lean never
+    // writes: it writes an object after the objects it points to.  There are
+    // no more objects than 8-byte words, so stop there rather than go round
+    // a cycle forever.
+    assert!(self.budget != 0, "the objects point to each other in a cycle");
+    self.budget -= 1;
     let save = self.is_reused(ptr);
     if save {
       self.write_op(mode, mode, SAVE);
     }
-    let (header, mut pos) = parse::<ObjHeader>(self.buf, (ptr - self.offset) as usize);
+    let (header, pos) = parse::<ObjHeader>(self.buf, (ptr - self.offset) as usize);
     // println!(
     //   "{:d$}{:x}: write {:?}[{d}]({:x}) {:x?}, {}, {} (save = {save})",
     //   "",
@@ -1293,17 +1362,15 @@ impl<W: Write> LgzWriter<'_, W> {
     //   header.sfields(),
     //   d = self.depth,
     // );
-    self.depth += 1;
+    // self.depth += 1;
     match header.tag {
       tag::ARRAY => {
         self.write_op(mode, LgzMode::Normal, ARRAY);
         let (size, pos) = parse_u64(self.buf, pos);
         self.write_i64(LgzMode::Normal, size.try_into().unwrap());
-        let (_capacity, mut pos) = parse_u64(self.buf, pos);
-        for _ in 0..size {
-          let (ptr2, pos2) = parse_u64(self.buf, pos);
-          self.write_obj(ptr2, LgzMode::Normal);
-          pos = pos2;
+        let (_capacity, pos) = parse_u64(self.buf, pos);
+        if size != 0 {
+          self.defer(Task::Fields(pos, size));
         }
       }
       tag::SCALAR_ARRAY => {
@@ -1366,7 +1433,7 @@ impl<W: Write> LgzWriter<'_, W> {
         };
         self.write_op(mode, LgzMode::Normal, tag);
         let (value, _) = parse_u64(self.buf, pos);
-        self.write_obj(value, LgzMode::Normal);
+        self.defer(Task::Obj(value, LgzMode::Normal));
       }
       tag::CLOSURE | tag::STRUCT_ARRAY | tag::EXTERNAL | tag::RESERVED => unreachable!(),
       ctor => {
@@ -1381,16 +1448,16 @@ impl<W: Write> LgzWriter<'_, W> {
             self.file.write_all(&[ctor, header.num_fields]).unwrap();
             self.file.write_all(&sfields.to_le_bytes()).unwrap();
           }
-          for _ in 0..header.num_fields {
-            let (ptr2, pos2) = parse_u64(self.buf, pos);
-            self.write_obj(ptr2, LgzMode::Normal);
-            pos = pos2;
+          if header.num_fields != 0 {
+            self.defer(Task::Fields(pos, header.num_fields.into()));
           }
-          self.file.write_all(&self.buf[pos..][..8 * sfields as usize]).unwrap();
+          if sfields != 0 {
+            self.defer(Task::Raw(pos + 8 * header.num_fields as usize, 8 * sfields as usize));
+          }
         }
       }
     }
-    self.depth -= 1;
+    // self.depth -= 1;
     // println!(
     //   "{:d$}{:x}: <- write[{d}]({:x}) {:x?}",
     //   "",
@@ -1400,7 +1467,7 @@ impl<W: Write> LgzWriter<'_, W> {
     //   d = self.depth,
     // );
     if save {
-      self.backrefs.insert(ptr, self.backrefs.len().try_into().unwrap());
+      self.defer(Task::Save(ptr));
     }
   }
 }
@@ -1430,6 +1497,7 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
     backrefs: Default::default(),
     stack: vec![],
     temp: vec![],
+    frames: vec![],
   };
   match version {
     LgzVersion::V0 => w.buf.write_all(b"oleanfile!!!!!!!").unwrap(),
@@ -1533,6 +1601,41 @@ struct LgzDecompressor<R> {
   backrefs: Vec<u64>,
   stack: Vec<U64<ZLE>>,
   temp: Vec<u8>,
+  /// The objects waiting for their fields, the innermost last.
+  frames: Vec<Frame>,
+}
+
+/// What `LgzDecompressor::write_obj` does after starting to read an object.
+enum Step {
+  /// Read an object in the mode: the first field of the object, which has
+  /// pushed a frame, or the object itself, in the other mode.
+  Read(LgzMode),
+  /// Pass the value of the object, now complete (the pointer to it, or the
+  /// boxed scalar), to the innermost frame.
+  Done(u64),
+}
+
+/// An object that `LgzDecompressor::write_obj` is reading the fields of.  An
+/// object is written after its fields, so the decompressor keeps the objects
+/// waiting for them on an explicit stack of these instead of recursing (see
+/// `Task`).
+#[derive(Clone, Copy)]
+enum Frame {
+  /// After `SAVE`: the object read next is also the next backref.
+  Save,
+  /// A constructor, whose fields read so far are on the stack from `start`.
+  Ctor { ctor: u8, num_fields: u8, sfields: u16, start: usize },
+  /// An array of `size` elements, of which those read so far are on the stack
+  /// from `start`.
+  Array { size: u64, start: usize },
+  /// A thunk, task, ref or promise, by its object tag, waiting for its value.
+  Boxed(u8),
+  /// An exprish object, whose fields are read in the modes `modes`; those read
+  /// so far are on the stack from `start`.
+  Exprish { tag: u8, modes: &'static [LgzMode], start: usize },
+  /// An application of `pos`, whose expression data is `data`, to `n` more
+  /// arguments.
+  App { pos: u64, data: u64, n: u8 },
 }
 
 impl<R: Read> LgzDecompressor<R> {
@@ -1605,12 +1708,8 @@ impl<R: Read> LgzDecompressor<R> {
     self.write_header(ctor, (num_fields as u16 + 1 + sfields) << 3, num_fields)
   }
 
-  fn write_ctor(&mut self, ctor: u8, num_fields: u8, sfields: u16) -> u64 {
-    let start = self.stack.len();
-    for _ in 0..num_fields {
-      let value = self.write_obj();
-      self.stack.push(value.into());
-    }
+  /// Writes the constructor, whose fields are on the stack from `start`.
+  fn write_ctor(&mut self, ctor: u8, num_fields: u8, sfields: u16, start: usize) -> u64 {
     let pos = self.write_ctor_header(ctor, num_fields, sfields);
     self.pop(start);
     let size = (sfields << 3) as usize;
@@ -1658,26 +1757,194 @@ impl<R: Read> LgzDecompressor<R> {
     pos
   }
 
-  fn write_exprish(&mut self) -> u64 {
+  /// Takes the `N` fields on the stack from `start`.
+  fn take_fields<const N: usize>(&mut self, start: usize) -> [u64; N] {
+    debug_assert_eq!(self.stack.len(), start + N);
+    let fields = std::array::from_fn(|i| self.stack[start + i].get());
+    self.stack.truncate(start);
+    fields
+  }
+
+  /// Reads an object and writes it with everything it points to, returning
+  /// the pointer to it (or the boxed scalar).
+  fn write_obj(&mut self) -> u64 {
+    debug_assert!(self.frames.is_empty());
+    let mut mode = LgzMode::Normal;
+    loop {
+      let step = match mode {
+        LgzMode::Normal => self.start_obj(),
+        LgzMode::Exprish => self.start_exprish(),
+      };
+      let mut value = match step {
+        Step::Read(next) => {
+          mode = next;
+          continue
+        }
+        Step::Done(value) => value,
+      };
+      // pass the value to the innermost waiting object, and so on outwards
+      // for each object that this completes
+      mode = loop {
+        match self.frames.last() {
+          None => return value,
+          Some(&Frame::Save) => self.backrefs.push(value),
+          Some(&Frame::Ctor { ctor, num_fields, sfields, start }) => {
+            self.stack.push(value.into());
+            if self.stack.len() - start < num_fields.into() {
+              break LgzMode::Normal
+            }
+            value = self.write_ctor(ctor, num_fields, sfields, start);
+          }
+          Some(&Frame::Array { size, start }) => {
+            self.stack.push(value.into());
+            if ((self.stack.len() - start) as u64) < size {
+              break LgzMode::Normal
+            }
+            value = self.write_array(size, start);
+          }
+          Some(&Frame::Boxed(tag)) => value = self.write_boxed(tag, value),
+          Some(&Frame::Exprish { tag, modes, start }) => {
+            self.stack.push(value.into());
+            if let Some(&mode) = modes.get(self.stack.len() - start) {
+              break mode
+            }
+            self.frames.pop();
+            match self.write_exprish(tag, start) {
+              Step::Read(mode) => break mode,
+              Step::Done(pos) => {
+                value = pos;
+                continue
+              }
+            }
+          }
+          Some(&Frame::App { pos, data, n }) => {
+            let (pos, data) = self.write_app(pos, data, value);
+            if n > 1 {
+              *self.frames.last_mut().unwrap() = Frame::App { pos, data, n: n - 1 };
+              break LgzMode::Exprish
+            }
+            value = pos;
+          }
+        }
+        self.frames.pop();
+      }
+    }
+  }
+
+  /// Writes the array of `size` elements, which are on the stack from `start`.
+  fn write_array(&mut self, size: u64, start: usize) -> u64 {
+    let pos = self.write_header(tag::ARRAY, 1, 0);
+    self.write_u64(size);
+    self.write_u64(size);
+    self.pop(start);
+    pos
+  }
+
+  /// Writes the thunk, task, ref or promise with object tag `tag`.
+  fn write_boxed(&mut self, tag: u8, value: u64) -> u64 {
+    let pos;
+    if let tag::THUNK | tag::TASK = tag {
+      pos = self.write_header(tag, 3 << 3, 0);
+      self.write_u64(value);
+      self.write_u64(0);
+    } else {
+      pos = self.write_header(tag, 2 << 3, 0);
+      self.write_u64(value);
+    }
+    pos
+  }
+
+  /// Writes the application of `pos`, whose expression data is `data`, to
+  /// `ptr2`, and returns the pointer to it and its expression data.
+  fn write_app(&mut self, pos: u64, data: u64, ptr2: u64) -> (u64, u64) {
+    let pos2 = self.write_ctor_header(5, 2, 1);
+    let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
+    let data = exprish::expr_app_data(data, data2);
+    // println!(
+    //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
+    //   "",
+    //   self.buf.len(),
+    //   self.file.pos,
+    //   [pos, ptr2]
+    //     .iter()
+    //     .map(|res| if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) })
+    //     .collect::<Vec<_>>(),
+    //   d = self.frames.len()
+    // );
+    self.write_u64(pos);
+    self.write_u64(ptr2);
+    self.write_u64(data);
+    (pos2, data)
+  }
+
+  /// Applies `pos`, whose expression data is `data`, to the next `n`
+  /// arguments.
+  fn apply(&mut self, pos: u64, data: u64, n: u8) -> Step {
+    if n == 0 {
+      return Step::Done(pos)
+    }
+    self.frames.push(Frame::App { pos, data, n });
+    Step::Read(LgzMode::Exprish)
+  }
+
+  /// Starts reading the `num_fields` fields of a constructor.
+  fn start_ctor(&mut self, ctor: u8, num_fields: u8, sfields: u16) -> Step {
+    let start = self.stack.len();
+    if num_fields == 0 {
+      return Step::Done(self.write_ctor(ctor, num_fields, sfields, start))
+    }
+    self.frames.push(Frame::Ctor { ctor, num_fields, sfields, start });
+    Step::Read(LgzMode::Normal)
+  }
+
+  fn start_exprish(&mut self) -> Step {
+    use LgzMode::{Exprish as E, Normal as N};
     let tag = self.file.read_u8().unwrap();
     // let start = self.buf.len();
     // println!(
     //   "{:d$}{start:x}: write_exprish[{d}]({:x}) {tag:x}",
     //   "",
     //   self.file.pos - 1,
-    //   d = self.depth
+    //   d = self.frames.len()
     // );
-    // self.depth += 1;
     #[allow(clippy::match_overlapping_arm)]
-    let res = match tag {
-      exprish::NORMAL => {
-        // println!("!!!");
-        self.write_obj()
+    let modes: &'static [LgzMode] = match tag {
+      exprish::NORMAL => return Step::Read(N),
+      exprish::NAME_STR | exprish::NAME_NUM => &[E, N],
+      exprish::LEVEL_SUCC | exprish::LEVEL_PARAM | exprish::LEVEL_MVAR => &[E],
+      exprish::LEVEL_MAX | exprish::LEVEL_IMAX => &[E, E],
+      exprish::EXPR_BVAR | exprish::EXPR_LIT => &[N],
+      exprish::EXPR_FVAR | exprish::EXPR_MVAR | exprish::EXPR_SORT => &[E],
+      exprish::EXPR_MDATA => &[N, E],
+      exprish::EXPR_PROJ => &[E, N, E],
+      exprish::EXPR_LET..=exprish::EXPR_LET_END => &[E, E, E, E],
+      exprish::EXPR_LAMBDA..=exprish::EXPR_FORALL_END => &[E, E, E],
+      ..=exprish::EXPR_APP => unreachable!(),
+      ..=exprish::EXPR_APP_END => &[E],
+      exprish::EXPR_CONST_APP..=exprish::EXPR_CONST_APP_END => &[E, N],
+      UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8 =>
+        return Step::Done(((self.read_i64(tag) << 1) | 1) as u64),
+      SAVE => {
+        self.frames.push(Frame::Save);
+        return Step::Read(E)
       }
+      BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4 => {
+        let r = self.read_backref(tag);
+        return Step::Done(self.backrefs[r as usize])
+      }
+      _ => unreachable!(),
+    };
+    self.frames.push(Frame::Exprish { tag, modes, start: self.stack.len() });
+    Step::Read(modes[0])
+  }
 
+  /// Writes the exprish object `tag`, whose fields are on the stack from
+  /// `start`.
+  fn write_exprish(&mut self, tag: u8, start: usize) -> Step {
+    #[allow(clippy::match_overlapping_arm)]
+    let pos = match tag {
       exprish::NAME_STR => {
-        let ptr1 = self.write_exprish();
-        let ptr2 = self.write_obj();
+        let [ptr1, ptr2] = self.take_fields(start);
         let pos = self.write_ctor_header(1, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
@@ -1688,8 +1955,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::NAME_NUM => {
-        let ptr1 = self.write_exprish();
-        let ptr2 = self.write_obj();
+        let [ptr1, ptr2] = self.take_fields(start);
         let pos = self.write_ctor_header(2, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
@@ -1701,7 +1967,7 @@ impl<R: Read> LgzDecompressor<R> {
       }
 
       exprish::LEVEL_SUCC => {
-        let ptr = self.write_exprish();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(1, 1, 1);
         self.write_u64(ptr);
         self.write_u64(exprish::level_succ_data(
@@ -1710,8 +1976,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::LEVEL_MAX => {
-        let ptr1 = self.write_exprish();
-        let ptr2 = self.write_exprish();
+        let [ptr1, ptr2] = self.take_fields(start);
         let pos = self.write_ctor_header(2, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
@@ -1722,8 +1987,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::LEVEL_IMAX => {
-        let ptr1 = self.write_exprish();
-        let ptr2 = self.write_exprish();
+        let [ptr1, ptr2] = self.take_fields(start);
         let pos = self.write_ctor_header(3, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
@@ -1734,7 +1998,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::LEVEL_PARAM => {
-        let ptr = self.write_exprish();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(4, 1, 1);
         self.write_u64(ptr);
         self.write_u64(exprish::level_param_data(
@@ -1743,7 +2007,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::LEVEL_MVAR => {
-        let ptr = self.write_exprish();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(5, 1, 1);
         self.write_u64(ptr);
         self
@@ -1752,7 +2016,7 @@ impl<R: Read> LgzDecompressor<R> {
       }
 
       exprish::EXPR_BVAR => {
-        let ptr = self.write_obj();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(0, 1, 1);
         self.write_u64(ptr);
         self.write_u64(exprish::expr_bvar_data(
@@ -1761,7 +2025,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::EXPR_FVAR => {
-        let ptr = self.write_exprish();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(1, 1, 1);
         self.write_u64(ptr);
         self
@@ -1769,7 +2033,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::EXPR_MVAR => {
-        let ptr = self.write_exprish();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(2, 1, 1);
         self.write_u64(ptr);
         self
@@ -1777,7 +2041,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::EXPR_SORT => {
-        let ptr = self.write_exprish();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(3, 1, 1);
         self.write_u64(ptr);
         self
@@ -1785,7 +2049,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::EXPR_LIT => {
-        let ptr = self.write_obj();
+        let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(9, 1, 1);
         self.write_u64(ptr);
         self.write_u64(exprish::expr_lit_data(
@@ -1794,8 +2058,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::EXPR_MDATA => {
-        let ptr1 = self.write_obj();
-        let ptr2 = self.write_exprish();
+        let [ptr1, ptr2] = self.take_fields(start);
         let pos = self.write_ctor_header(10, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
@@ -1805,9 +2068,7 @@ impl<R: Read> LgzDecompressor<R> {
         pos
       }
       exprish::EXPR_PROJ => {
-        let ptr1 = self.write_exprish();
-        let ptr2 = self.write_obj();
-        let ptr3 = self.write_exprish();
+        let [ptr1, ptr2, ptr3] = self.take_fields(start);
         let pos = self.write_ctor_header(11, 3, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
@@ -1819,11 +2080,8 @@ impl<R: Read> LgzDecompressor<R> {
         ));
         pos
       }
-      tag @ exprish::EXPR_LET..=exprish::EXPR_LET_END => {
-        let name = self.write_exprish();
-        let ty = self.write_exprish();
-        let value = self.write_exprish();
-        let body = self.write_exprish();
+      exprish::EXPR_LET..=exprish::EXPR_LET_END => {
+        let [name, ty, value, body] = self.take_fields(start);
         let pos = self.write_ctor_header(8, 4, 2);
         self.write_u64(name);
         self.write_u64(ty);
@@ -1837,10 +2095,8 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64((tag & 1) as u64);
         pos
       }
-      tag @ exprish::EXPR_LAMBDA..=exprish::EXPR_FORALL_END => {
-        let name = self.write_exprish();
-        let ty = self.write_exprish();
-        let body = self.write_exprish();
+      exprish::EXPR_LAMBDA..=exprish::EXPR_FORALL_END => {
+        let [name, ty, body] = self.take_fields(start);
         let pos = self.write_ctor_header(tag >> 2, 3, 2);
         self.write_u64(name);
         self.write_u64(ty);
@@ -1852,94 +2108,28 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64((tag & 3) as u64);
         pos
       }
-      ..=exprish::EXPR_APP => unreachable!(),
-      tag @ ..=exprish::EXPR_APP_END => {
-        let mut pos = self.write_exprish();
-        let mut data = get_expr_data(&self.buf, self.offset, pos).unwrap();
-        for _ in 0..tag & 0x1f {
-          let ptr2 = self.write_exprish();
-          let pos2 = self.write_ctor_header(5, 2, 1);
-          let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
-          data = exprish::expr_app_data(data, data2);
-          // println!(
-          //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
-          //   "",
-          //   self.buf.len(),
-          //   self.file.pos,
-          //   [pos, ptr2]
-          //     .iter()
-          //     .map(|res| if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) })
-          //     .collect::<Vec<_>>(),
-          //   d = self.depth
-          // );
-          self.write_u64(pos);
-          self.write_u64(ptr2);
-          self.write_u64(data);
-          pos = pos2
-        }
-        pos
+      ..=exprish::EXPR_APP_END => {
+        let [ptr] = self.take_fields(start);
+        let data = get_expr_data(&self.buf, self.offset, ptr).unwrap();
+        return self.apply(ptr, data, tag & 0x1f)
       }
-      tag @ exprish::EXPR_CONST_APP..=exprish::EXPR_CONST_APP_END => {
-        let ptr1 = self.write_exprish();
+      exprish::EXPR_CONST_APP..=exprish::EXPR_CONST_APP_END => {
+        let [ptr1, ptr2] = self.take_fields(start);
         let hash1 = get_name_hash(&self.buf, self.offset, ptr1).unwrap();
-        let ptr2 = self.write_obj();
         let (hash2, bits2) = get_list_level_data(&self.buf, self.offset, ptr2);
-        let mut data = exprish::expr_const_data(hash1, hash2, bits2);
-        let mut pos = self.write_ctor_header(4, 2, 1);
+        let data = exprish::expr_const_data(hash1, hash2, bits2);
+        let pos = self.write_ctor_header(4, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(data);
-        for _ in 0..tag & 0x1f {
-          let ptr2 = self.write_exprish();
-          let pos2 = self.write_ctor_header(5, 2, 1);
-          let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
-          data = exprish::expr_app_data(data, data2);
-          // println!(
-          //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
-          //   "",
-          //   self.buf.len(),
-          //   self.file.pos,
-          //   [pos, ptr2]
-          //     .iter()
-          //     .map(|res| if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) })
-          //     .collect::<Vec<_>>(),
-          //   d = self.depth
-          // );
-          self.write_u64(pos);
-          self.write_u64(ptr2);
-          self.write_u64(data);
-          pos = pos2
-        }
-        pos
-      }
-
-      tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
-        ((self.read_i64(tag) << 1) | 1) as u64,
-      SAVE => {
-        // self.depth -= 1;
-        let pos = self.write_exprish();
-        self.backrefs.push(pos);
-        return pos
-      }
-      tag @ (BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4) => {
-        let r = self.read_backref(tag);
-        self.backrefs[r as usize]
+        return self.apply(pos, data, tag & 0x1f)
       }
       _ => unreachable!(),
     };
-    // self.depth -= 1;
-    // println!(
-    //   "{:d$}{start:x}: write_exprish[{d}]({:x}) {tag:x} -> {:x?} -> {:x}",
-    //   "",
-    //   self.file.pos,
-    //   if res & 1 == 0 { Ok(res - self.offset) } else { Err(res >> 1) },
-    //   self.buf.len(),
-    //   d = self.depth,
-    // );
-    res
+    Step::Done(pos)
   }
 
-  fn write_obj(&mut self) -> u64 {
+  fn start_obj(&mut self) -> Step {
     let tag = self.file.read_u8().unwrap();
     // let start = self.buf.len();
     // println!(
@@ -1948,20 +2138,19 @@ impl<R: Read> LgzDecompressor<R> {
     //   self.file.pos - 1,
     //   tag >> 4,
     //   unpack_ctor(tag),
-    //   d = self.depth,
+    //   d = self.frames.len(),
     // );
-    // self.depth += 1;
     let pos;
     match tag {
       BIG_CTOR => {
         let ctor = self.file.read_u8().unwrap();
         let num_fields = self.file.read_u8().unwrap();
         let sfields = self.file.read_u16::<LE>().unwrap();
-        pos = self.write_ctor(ctor, num_fields, sfields)
+        return self.start_ctor(ctor, num_fields, sfields)
       }
       SAVE => {
-        pos = self.write_obj();
-        self.backrefs.push(pos);
+        self.frames.push(Frame::Save);
+        return Step::Read(LgzMode::Normal)
       }
       tag @ (BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4) => {
         let r = self.read_backref(tag);
@@ -1971,14 +2160,12 @@ impl<R: Read> LgzDecompressor<R> {
         let tag = self.file.read_u8().unwrap();
         let size = self.read_i64(tag) as u64;
         let start = self.stack.len();
-        for _ in 0..size {
-          let value = self.write_obj();
-          self.stack.push(value.into());
+        if size == 0 {
+          pos = self.write_array(size, start)
+        } else {
+          self.frames.push(Frame::Array { size, start });
+          return Step::Read(LgzMode::Normal)
         }
-        pos = self.write_header(tag::ARRAY, 1, 0);
-        self.write_u64(size);
-        self.write_u64(size);
-        self.pop(start);
       }
       BYTE_ARRAY | SCALAR_ARRAY => {
         let elem_size = if tag == BYTE_ARRAY { 1 } else { self.file.read_u8().unwrap() };
@@ -2018,47 +2205,26 @@ impl<R: Read> LgzDecompressor<R> {
           self.buf.write_all(&self.temp).unwrap();
         }
       }
-      THUNK => {
-        let value = self.write_obj();
-        pos = self.write_header(tag::THUNK, 3 << 3, 0);
-        self.write_u64(value);
-        self.write_u64(0);
+      THUNK | TASK | REF | PROMISE => {
+        let tag = match tag {
+          THUNK => tag::THUNK,
+          TASK => tag::TASK,
+          REF => tag::REF,
+          _ => tag::PROMISE,
+        };
+        self.frames.push(Frame::Boxed(tag));
+        return Step::Read(LgzMode::Normal)
       }
-      TASK => {
-        let value = self.write_obj();
-        pos = self.write_header(tag::TASK, 3 << 3, 0);
-        self.write_u64(value);
-        self.write_u64(0);
-      }
-      REF => {
-        let value = self.write_obj();
-        pos = self.write_header(tag::REF, 2 << 3, 0);
-        self.write_u64(value);
-      }
-      PROMISE => {
-        let value = self.write_obj();
-        pos = self.write_header(tag::PROMISE, 2 << 3, 0);
-        self.write_u64(value);
-      }
-      EXPRISH => pos = self.write_exprish(),
+      EXPRISH => return Step::Read(LgzMode::Exprish),
       tag @ ..=0xcf if tag & 15 == 0 => panic!("unknown opcode {tag:#x}"),
       tag @ ..=0xcf => {
         let ctor = tag >> 4;
         let (num_fields, sfields) = unpack_ctor(tag);
-        pos = self.write_ctor(ctor, num_fields, sfields)
+        return self.start_ctor(ctor, num_fields, sfields)
       }
       tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
         pos = ((self.read_i64(tag) << 1) | 1) as u64,
     }
-    // self.depth -= 1;
-    // println!(
-    //   "{:d$}{start:x}: write_obj[{d}]({:x}) {tag:x} -> {:x?} -> {:x}",
-    //   "",
-    //   self.file.pos,
-    //   if pos & 1 == 0 { Ok(pos - self.offset) } else { Err(pos >> 1) },
-    //   self.buf.len(),
-    //   d = self.depth,
-    // );
-    pos
+    Step::Done(pos)
   }
 }
