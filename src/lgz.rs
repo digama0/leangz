@@ -835,6 +835,10 @@ fn get_lit_hash(cfg: Config, buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
     return None
   }
   let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+  if header.num_fields == 0 {
+    // not a `Literal`, and there is no field to read
+    return None
+  }
   match header.tag {
     0 => get_num_hash(cfg, buf, offset, parse_u64(buf, pos).0),
     1 => get_str_hash(buf, offset, parse_u64(buf, pos).0),
@@ -846,18 +850,16 @@ fn get_list_level_data(buf: &[u8], offset: u64, mut ptr: u64) -> (u64, u8) {
   let (mut hash, mut bits) = (7, 0);
   while ptr & 1 == 0 {
     let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
-    if header.tag != 1 {
+    if header.tag != 1 || header.num_fields < 2 {
       break
     }
-    if header.num_fields >= 2 {
-      let (ptr1, pos) = parse_u64(buf, pos);
-      let (ptr2, _) = parse_u64(buf, pos);
-      let Some(data) = get_level_data(buf, offset, ptr1) else { break };
-      let (h1, _, bits1) = exprish::unpack_level_data(data);
-      hash = mix_hash(hash, h1 as u64);
-      bits |= bits1;
-      ptr = ptr2
-    }
+    let (ptr1, pos) = parse_u64(buf, pos);
+    let (ptr2, _) = parse_u64(buf, pos);
+    let Some(data) = get_level_data(buf, offset, ptr1) else { break };
+    let (h1, _, bits1) = exprish::unpack_level_data(data);
+    hash = mix_hash(hash, h1 as u64);
+    bits |= bits1;
+    ptr = ptr2
   }
   (hash, bits)
 }
