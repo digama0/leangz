@@ -282,6 +282,7 @@ pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
     cfg,
     file: WithPosition { r: outfile, pos: 0 },
     refs: &refs,
+    budget: refs.len(),
     offset,
     backrefs: Default::default(),
     buf: rest,
@@ -493,6 +494,8 @@ struct LgzWriter<'a, W> {
   backrefs: HashMap<u64, u32>,
   /// What remains to be written, the next step last.
   tasks: Vec<Task>,
+  /// How many more objects there is room for; see `write_one`.
+  budget: usize,
 }
 
 /// A step of `LgzWriter::write_obj`.  Objects can point to each other in
@@ -873,6 +876,11 @@ fn get_list_level_data(buf: &[u8], offset: u64, mut ptr: u64) -> (u64, u8) {
     }
     let (ptr1, pos) = parse_u64(buf, pos);
     let (ptr2, _) = parse_u64(buf, pos);
+    if ptr2 >= ptr {
+      // Lean writes an object after the objects it points to, so the tail
+      // of a list comes before it; stop rather than go round a cycle
+      break
+    }
     let Some(data) = get_level_data(buf, offset, ptr1) else { break };
     let (h1, _, bits1) = exprish::unpack_level_data(data);
     hash = mix_hash(hash, h1 as u64);
@@ -1330,6 +1338,13 @@ impl<W: Write> LgzWriter<'_, W> {
       self.write_backref(mode, i);
       return
     }
+    // Every object is written once, and written again only as a backref,
+    // unless it points back to itself through its fields, which Lean never
+    // writes: it writes an object after the objects it points to.  There are
+    // no more objects than 8-byte words, so stop there rather than go round
+    // a cycle forever.
+    assert!(self.budget != 0, "the objects point to each other in a cycle");
+    self.budget -= 1;
     let save = self.is_reused(ptr);
     if save {
       self.write_op(mode, mode, SAVE);
