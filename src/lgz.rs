@@ -598,7 +598,7 @@ pub(crate) mod exprish {
     pack_expr_data(mix_hash(5, mix_hash(hash1, hash2)), 0, 0, bits2 << 2)
   }
   pub(crate) const fn expr_bvar_data(n: u64) -> u64 {
-    pack_expr_data(mix_hash(7, n), n as u32 + 1, 0, 0)
+    pack_expr_data(mix_hash(7, n), (n as u32).wrapping_add(1), 0, 0)
   }
   pub(crate) const fn expr_sort_data(data: u64) -> u64 {
     let (h, _, bits) = unpack_level_data(data);
