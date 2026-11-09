@@ -161,3 +161,49 @@ fn test_wide_scalar_array_roundtrip() {
     ".olean with a wide scalar array does not match after compression/decompression"
   );
 }
+
+/// `ExprHash` was built with a Lean version that writes version 4 `.olean`s, whose compacted data
+/// is framed by its size and a closure section, and whose `Expr` hashes changed in
+/// leanprover/lean4#16107.
+#[test]
+fn test_v4_module_roundtrip() {
+  let test_data_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/module");
+  let read = |ext: &str| {
+    fs::read(format!("{test_data_dir}/ExprHash.{ext}")).expect("Failed to read .olean file")
+  };
+  let (olean, server, private) = (read("olean"), read("olean.server"), read("olean.private"));
+  for part in [&olean, &server, &private] {
+    assert_eq!(part[5], 4, "expected a version 4 .olean");
+    assert!(leangz::lgz::is_supported(part));
+  }
+
+  let mut compressed = Vec::new();
+  leangz::lgz::compress(&[&olean, &server, &private], &mut compressed);
+  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 3);
+
+  assert_eq!(ranges.len(), 3, "Expected 3 ranges for the 3 files");
+  assert_eq!(olean, &decompressed_buf[ranges[0].clone()]);
+  assert_eq!(server, &decompressed_buf[ranges[1].clone()]);
+  assert_eq!(private, &decompressed_buf[ranges[2].clone()]);
+
+  // `Expr` data that `lgz` fails to recompute is stored verbatim, which still round-trips but
+  // roughly doubles the size for this module.
+  let input_size = olean.len() + server.len() + private.len();
+  assert!(
+    compressed.len() * 100 < input_size * 20,
+    "compressed to {} of {input_size} bytes; are the `Expr` hashes recomputed correctly?",
+    compressed.len()
+  );
+}
+
+/// A version 4 `.olean` with closures records them after the compacted data, which `lgz` does
+/// not support.
+#[test]
+fn test_v4_closures_unsupported() {
+  let test_data_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/module");
+  let mut olean = fs::read(format!("{test_data_dir}/ExprHash.olean")).unwrap();
+  let len = olean.len();
+  // `num_closure_offsets = 1`
+  olean[len - 8] = 1;
+  assert!(!leangz::lgz::is_supported(&olean));
+}

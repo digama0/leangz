@@ -42,6 +42,7 @@ enum OLeanVersion {
   V0,
   V1,
   V2,
+  V4,
 }
 
 #[repr(C, align(8))]
@@ -122,7 +123,7 @@ fn parse_as_v0(olean: &[u8]) -> (Header, &[u8]) {
   assert_eq!(&header.magic, b"oleanfile!!!!!!!");
   let base = header.base.get();
   let offset = base + size_of::<HeaderV0>() as u64;
-  let cfg = Config { use_gmp: use_gmp(false) };
+  let cfg = Config { use_gmp: use_gmp(false), expr_hash_v2: false };
   let lean_version = LeanVersion::UNKNOWN;
   let vheader = VHeader { lean_version, githash: [0; 40] };
   (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
@@ -177,7 +178,7 @@ fn parse_as_v1(olean: &[u8]) -> (Header, &[u8]) {
   let offset = base + size_of::<HeaderV1>() as u64;
   let mut githash = [0; 40];
   githash.copy_from_slice(&header.githash);
-  let cfg = Config { use_gmp: use_gmp(mac_v1_use_gmp(&header.githash)) };
+  let cfg = Config { use_gmp: use_gmp(mac_v1_use_gmp(&header.githash)), expr_hash_v2: false };
   let lean_version = LeanVersion::UNKNOWN;
   let vheader = VHeader { lean_version, githash };
   (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
@@ -204,22 +205,84 @@ fn parse_as_v2(olean: &[u8]) -> (Header, &[u8]) {
   let offset = base + size_of::<HeaderV2>() as u64;
   let mut githash = [0; 40];
   githash.copy_from_slice(&header.githash);
-  let cfg = Config { use_gmp: header.flags != 0 };
+  let cfg = Config { use_gmp: header.flags != 0, expr_hash_v2: false };
   let lean_version = LeanVersion::parse(&header.lean_version);
   let vheader = VHeader { lean_version, githash };
   (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
 }
 
-fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
+/// Since version 4 (Lean 4.37), the compacted data is preceded by its size and followed by
+/// sections that record closures. `compress` supports only files without closures, where
+/// these sections are 8 zero bytes: no closure offsets and no libraries.
+#[repr(C, align(8))]
+#[derive(KnownLayout, Immutable, FromBytes)]
+struct HeaderV4 {
+  magic: [u8; 5],
+  version: u8,
+  flags: u8,
+  lean_version: [u8; 33],
+  githash: [u8; 40],
+  base: U64<ZLE>,
+  data_size: U64<ZLE>,
+  root: U64<ZLE>,
+}
+
+/// The bytes following the compacted data in a version 4 `.olean` without closures.
+const V4_TRAILER: [u8; 8] = [0; 8];
+
+/// The objects of a version 4 `.olean` (after the root pointer), if it has no closures.
+fn v4_objects(olean: &[u8]) -> Option<&[u8]> {
+  let (header, rest) = Ref::<_, HeaderV4>::from_prefix(olean).ok()?;
+  let data_size = usize::try_from(header.data_size.get()).ok()?;
+  let objects_size = data_size.checked_sub(size_of::<u64>())?;
+  let (objects, trailer) = rest.split_at_checked(objects_size)?;
+  (trailer == V4_TRAILER).then_some(objects)
+}
+
+fn parse_as_v4(olean: &[u8]) -> (Header, &[u8]) {
+  let (header, _) = Ref::<_, HeaderV4>::from_prefix(olean).expect("bad header");
+  assert_eq!(&header.magic, b"olean");
+  assert_eq!(header.version, 4);
+  assert_eq!(header.flags & !1, 0);
+  let rest = v4_objects(olean).expect("unsupported .olean: contains closures");
+  let base = header.base.get();
+  let offset = base + size_of::<HeaderV4>() as u64;
+  let mut githash = [0; 40];
+  githash.copy_from_slice(&header.githash);
+  let cfg = Config { use_gmp: header.flags != 0, expr_hash_v2: true };
+  let lean_version = LeanVersion::parse(&header.lean_version);
+  let vheader = VHeader { lean_version, githash };
+  (Header { cfg, vheader, base, root: header.root.get(), offset }, rest)
+}
+
+fn try_sniff_olean_version(olean: &[u8]) -> Option<OLeanVersion> {
   if Ref::<_, HeaderV0>::from_prefix(olean)
     .is_ok_and(|(header, _)| header.magic == *b"oleanfile!!!!!!!")
   {
-    return OLeanVersion::V0
+    return Some(OLeanVersion::V0)
   }
-  match Ref::<_, HeaderV1>::from_prefix(olean).expect("bad header").0.version {
-    1 => OLeanVersion::V1,
-    2 => OLeanVersion::V2,
-    v => panic!("unexpected olean version: {v}"),
+  match Ref::<_, HeaderV1>::from_prefix(olean).ok()?.0.version {
+    1 => Some(OLeanVersion::V1),
+    2 => Some(OLeanVersion::V2),
+    4 => Some(OLeanVersion::V4),
+    _ => None,
+  }
+}
+
+fn sniff_olean_version(olean: &[u8]) -> OLeanVersion {
+  try_sniff_olean_version(olean).unwrap_or_else(|| {
+    let version = Ref::<_, HeaderV1>::from_prefix(olean).expect("bad header").0.version;
+    panic!("unexpected olean version: {version}")
+  })
+}
+
+/// Whether `compress` can handle this `.olean`: it must have a known version and, since
+/// version 4, contain no closures.
+pub fn is_supported(olean: &[u8]) -> bool {
+  match try_sniff_olean_version(olean) {
+    None => false,
+    Some(OLeanVersion::V4) => v4_objects(olean).is_some(),
+    Some(_) => true,
   }
 }
 
@@ -228,12 +291,15 @@ fn parse_olean_header(version: OLeanVersion, olean: &[u8]) -> (Header, &[u8]) {
     OLeanVersion::V0 => parse_as_v0(olean),
     OLeanVersion::V1 => parse_as_v1(olean),
     OLeanVersion::V2 => parse_as_v2(olean),
+    OLeanVersion::V4 => parse_as_v4(olean),
   }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Config {
   use_gmp: bool,
+  /// Whether `Expr` data uses the hashes introduced in Lean 4.37 (leanprover/lean4#16107).
+  expr_hash_v2: bool,
 }
 
 pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
@@ -307,8 +373,8 @@ pub fn compress(oleans: &[&[u8]], outfile: impl Write) {
       w.file.write_u64::<LE>(olean.len() as u64).unwrap();
       w.file.write_all(&githash).unwrap();
     }
-    OLeanVersion::V2 => {
-      w.file.write_all(&MAGIC2).unwrap();
+    OLeanVersion::V2 | OLeanVersion::V4 => {
+      w.file.write_all(if version == OLeanVersion::V4 { &MAGIC3 } else { &MAGIC2 }).unwrap();
       w.file.write_u32::<LE>((base >> 16) as u32).unwrap();
       w.file.write_u64::<LE>(end - base).unwrap();
       w.file.write_all(&githash).unwrap();
@@ -497,6 +563,7 @@ pub const NAME_ANON_HASH: u64 = 1723;
 pub(crate) const MAGIC0: [u8; 4] = *b"LGZ!";
 pub(crate) const MAGIC1: [u8; 4] = *b"LGZ1";
 pub(crate) const MAGIC2: [u8; 4] = *b"LGZ2";
+pub(crate) const MAGIC3: [u8; 4] = *b"LGZ3";
 
 // These are valid in normal and exprish mode
 pub(crate) const UINT0: u8 = 0xd0;
@@ -528,7 +595,7 @@ pub(crate) const SIZED_STRING: u8 = 0xb0;
 
 // only valid in exprish mode
 pub(crate) mod exprish {
-  use super::mix_hash;
+  use super::{mix_hash, mix_hash32};
 
   pub(crate) const NORMAL: u8 = 0x20;
 
@@ -611,36 +678,53 @@ pub(crate) mod exprish {
   pub(crate) const fn expr_mvar_data(hash: u64) -> u64 {
     pack_expr_data(mix_hash(17, mix_hash(0, hash)), 0, 0, 2)
   }
-  pub(crate) const fn expr_mdata_data(data: u64) -> u64 {
+  // The functions taking `v2` compute the hashes introduced in Lean 4.37 (leanprover/lean4#16107)
+  // if it is set, and the older ones otherwise.
+  pub(crate) const fn expr_mdata_data(v2: bool, data: u64) -> u64 {
     let (h, bvars, depth, bits) = unpack_expr_data(data);
-    let h = mix_hash(depth as u64 + 1, h);
+    let h = if v2 { mix_hash32(19, h as u32) as u64 } else { mix_hash(depth as u64 + 1, h) };
     pack_expr_data(h, bvars, depth.saturating_add(1), bits)
   }
-  pub(crate) const fn expr_proj_data(hash1: u64, num2: u64, data3: u64) -> u64 {
+  pub(crate) const fn expr_proj_data(v2: bool, hash1: u64, num2: u64, data3: u64) -> u64 {
     let (h, bvars, depth, bits) = unpack_expr_data(data3);
-    let h = mix_hash(depth as u64 + 1, mix_hash(hash1, mix_hash(num2, h)));
+    let h = if v2 {
+      mix_hash32(mix_hash(23, mix_hash(hash1, num2)) as u32, h as u32) as u64
+    } else {
+      mix_hash(depth as u64 + 1, mix_hash(hash1, mix_hash(num2, h)))
+    };
     pack_expr_data(h, bvars, depth.saturating_add(1), bits)
   }
-  pub(crate) fn expr_app_data(data1: u64, data2: u64) -> u64 {
+  pub(crate) fn expr_app_data(v2: bool, data1: u64, data2: u64) -> u64 {
     let (_, bvars1, depth1, bits1) = unpack_expr_data(data1);
     let (_, bvars2, depth2, bits2) = unpack_expr_data(data2);
     let depth = depth1.max(depth2).saturating_add(1);
-    pack_expr_data(mix_hash(data1, data2), bvars1.max(bvars2), depth, bits1 | bits2)
+    let h = if v2 { mix_hash32(data1 as u32, data2 as u32) as u64 } else { mix_hash(data1, data2) };
+    pack_expr_data(h, bvars1.max(bvars2), depth, bits1 | bits2)
   }
-  pub(crate) fn expr_binder_data(data1: u64, data2: u64) -> u64 {
+  pub(crate) fn expr_binder_data(v2: bool, forall: bool, data1: u64, data2: u64) -> u64 {
     let (h1, bvars1, depth1, bits1) = unpack_expr_data(data1);
     let (h2, bvars2, depth2, bits2) = unpack_expr_data(data2);
     let depth = depth1.max(depth2);
-    let h = mix_hash(depth as u64 + 1, mix_hash(h1, h2));
+    let h = if v2 {
+      let salt = if forall { 31 } else { 29 };
+      mix_hash32(mix_hash32(salt, h1 as u32), h2 as u32) as u64
+    } else {
+      mix_hash(depth as u64 + 1, mix_hash(h1, h2))
+    };
     let bvars = bvars1.max(bvars2.saturating_sub(1));
     pack_expr_data(h, bvars, depth.saturating_add(1), bits1 | bits2)
   }
-  pub(crate) fn expr_let_data(data1: u64, data2: u64, data3: u64) -> u64 {
+  pub(crate) fn expr_let_data(v2: bool, non_dep: bool, data1: u64, data2: u64, data3: u64) -> u64 {
     let (h1, bvars1, depth1, bits1) = unpack_expr_data(data1);
     let (h2, bvars2, depth2, bits2) = unpack_expr_data(data2);
     let (h3, bvars3, depth3, bits3) = unpack_expr_data(data3);
     let depth = depth1.max(depth2).max(depth3);
-    let h = mix_hash(depth as u64 + 1, mix_hash(h1, mix_hash(h2, h3)));
+    let h = if v2 {
+      let salt = if non_dep { 41 } else { 37 };
+      mix_hash32(mix_hash32(mix_hash32(salt, h1 as u32), h2 as u32), h3 as u32) as u64
+    } else {
+      mix_hash(depth as u64 + 1, mix_hash(h1, mix_hash(h2, h3)))
+    };
     let bvars = bvars1.max(bvars2).max(bvars3.saturating_sub(1));
     pack_expr_data(h, bvars, depth.saturating_add(1), bits1 | bits2 | bits3)
   }
@@ -682,6 +766,17 @@ pub const fn mix_hash(mut h: u64, mut k: u64) -> u64 {
   h ^= k;
   h = h.wrapping_mul(m);
   h
+}
+
+/// `lean_uint32_mix_hash`: the block step of `MurmurHash3_x86_32`, except that the rotation of `k`
+/// is replaced with `k ^= k >> 15`.
+pub const fn mix_hash32(mut h: u32, mut k: u32) -> u32 {
+  k = k.wrapping_mul(0xcc9e2d51);
+  k ^= k >> 15;
+  k = k.wrapping_mul(0x1b873593);
+  h ^= k;
+  h = h.rotate_left(13);
+  h.wrapping_mul(5).wrapping_add(0xe6546b64)
 }
 
 pub fn str_hash(bytes: &[u8]) -> u64 {
@@ -955,7 +1050,7 @@ impl<W: Write> LgzWriter<'_, W> {
           let (ptr2, pos) = parse_u64(self.buf, pos);
           let Some(data1) = get_expr_data(self.buf, self.offset, ptr1) else { break };
           let Some(data2) = get_expr_data(self.buf, self.offset, ptr2) else { break };
-          if exprish::expr_app_data(data1, data2) == parse_u64(self.buf, pos).0 {
+          if exprish::expr_app_data(self.cfg.expr_hash_v2, data1, data2) == parse_u64(self.buf, pos).0 {
             ptr = Some(ptr1);
             stack.push(ptr2);
             if ptr1 & 1 == 0 && !self.is_reused(ptr1) {
@@ -968,7 +1063,7 @@ impl<W: Write> LgzWriter<'_, W> {
           #[cfg(feature = "debug")]
           panic!(
             "{_p0}: failed app data: {data1:x} + {data2:x} = {:x} != {:x}",
-            exprish::expr_app_data(data1, data2),
+            exprish::expr_app_data(self.cfg.expr_hash_v2, data1, data2),
             parse_u64(self.buf, pos).0,
           )
         }
@@ -1166,7 +1261,7 @@ impl<W: Write> LgzWriter<'_, W> {
         let (bi, _) = parse_u64(self.buf, pos);
         let data1 = get_expr_data(self.buf, self.offset, ty)?;
         let data2 = get_expr_data(self.buf, self.offset, body)?;
-        if exprish::expr_binder_data(data1, data2) == data && bi & !3 == 0 {
+        if exprish::expr_binder_data(self.cfg.expr_hash_v2, ctor == 7, data1, data2) == data && bi & !3 == 0 {
           self.write_op(mode, LgzMode::Exprish, (ctor << 2) + bi as u8);
           self.write_obj(name, LgzMode::Exprish);
           self.write_obj(ty, LgzMode::Exprish);
@@ -1176,7 +1271,7 @@ impl<W: Write> LgzWriter<'_, W> {
         #[cfg(feature = "debug")]
         panic!(
           "{_p0}: failed binder data: {data1:x} + {data2:x} = {:x} != {data:x}",
-          exprish::expr_binder_data(data1, data2),
+          exprish::expr_binder_data(self.cfg.expr_hash_v2, ctor == 7, data1, data2),
         )
       }
       (8, 4, 2) => {
@@ -1188,6 +1283,8 @@ impl<W: Write> LgzWriter<'_, W> {
         let (data, pos) = parse_u64(self.buf, pos);
         let (non_dep, _) = parse_u64(self.buf, pos);
         if exprish::expr_let_data(
+          self.cfg.expr_hash_v2,
+          non_dep == 1,
           get_expr_data(self.buf, self.offset, ty)?,
           get_expr_data(self.buf, self.offset, value)?,
           get_expr_data(self.buf, self.offset, body)?,
@@ -1223,7 +1320,10 @@ impl<W: Write> LgzWriter<'_, W> {
         // Expr.mdata
         let (ptr1, pos) = parse_u64(self.buf, pos);
         let (ptr2, pos) = parse_u64(self.buf, pos);
-        if exprish::expr_mdata_data(get_expr_data(self.buf, self.offset, ptr2)?)
+        if exprish::expr_mdata_data(
+          self.cfg.expr_hash_v2,
+          get_expr_data(self.buf, self.offset, ptr2)?,
+        )
           == parse_u64(self.buf, pos).0
         {
           self.write_op(mode, LgzMode::Exprish, exprish::EXPR_MDATA);
@@ -1238,6 +1338,7 @@ impl<W: Write> LgzWriter<'_, W> {
         let (ptr2, pos) = parse_u64(self.buf, pos);
         let (ptr3, pos) = parse_u64(self.buf, pos);
         if exprish::expr_proj_data(
+          self.cfg.expr_hash_v2,
           get_name_hash(self.buf, self.offset, ptr1)?,
           get_num_hash(self.cfg, self.buf, self.offset, ptr2)?,
           get_expr_data(self.buf, self.offset, ptr3)?,
@@ -1405,16 +1506,19 @@ impl<W: Write> LgzWriter<'_, W> {
   }
 }
 
+#[derive(PartialEq, Eq)]
 enum LgzVersion {
   V0,
   V1,
   V2,
+  V3,
 }
 
 pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<usize>>) {
   let mut magic = [0u8; 4];
   infile.read_exact(&mut magic).unwrap();
   let version = match magic {
+    MAGIC3 => LgzVersion::V3,
     MAGIC2 => LgzVersion::V2,
     MAGIC1 => LgzVersion::V1,
     MAGIC0 => LgzVersion::V0,
@@ -1422,7 +1526,7 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
   };
   let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
   let mut w = LgzDecompressor {
-    cfg: Config { use_gmp: use_gmp(false) },
+    cfg: Config { use_gmp: use_gmp(false), expr_hash_v2: version == LgzVersion::V3 },
     buf: Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize),
     file: WithPosition { r: infile, pos: 8 },
     offset: base,
@@ -1444,9 +1548,9 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
       w.buf.extend_from_slice(&githash_in);
       w.buf.extend_from_slice(&[0; 2]);
     }
-    LgzVersion::V2 => {
+    LgzVersion::V2 | LgzVersion::V3 => {
       w.buf.extend_from_slice(b"olean");
-      w.buf.push(2);
+      w.buf.push(if version == LgzVersion::V3 { 4 } else { 2 });
       let mut githash_in = [0; 40];
       w.file.read_exact(&mut githash_in).unwrap();
       let flags = w.file.read_u8().unwrap();
@@ -1469,6 +1573,10 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
   }
   let base_pos = w.buf.len();
   w.buf.write_u64::<LE>(base).unwrap();
+  let data_size_pos = w.buf.len();
+  if version == LgzVersion::V3 {
+    w.buf.write_u64::<LE>(0).unwrap(); // fixed below
+  }
   let fixup_pos = w.buf.len();
   w.buf.write_u64::<LE>(0).unwrap(); // fixed below
   let header_size = w.buf.len();
@@ -1477,6 +1585,11 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
   loop {
     let root = w.write_obj();
     LE::write_u64(&mut w.buf[(extra + fixup_pos)..], root);
+    if version == LgzVersion::V3 {
+      let data_size = (w.buf.len() - (extra + fixup_pos)) as u64;
+      LE::write_u64(&mut w.buf[(extra + data_size_pos)..], data_size);
+      w.buf.extend_from_slice(&V4_TRAILER);
+    }
     ranges.push(extra..w.buf.len());
     n -= 1;
     if n == 0 {
@@ -1800,6 +1913,7 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(exprish::expr_mdata_data(
+          self.cfg.expr_hash_v2,
           get_expr_data(&self.buf, self.offset, ptr2).unwrap(),
         ));
         pos
@@ -1813,6 +1927,7 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr2);
         self.write_u64(ptr3);
         self.write_u64(exprish::expr_proj_data(
+          self.cfg.expr_hash_v2,
           get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
           get_num_hash(self.cfg, &self.buf, self.offset, ptr2).unwrap(),
           get_expr_data(&self.buf, self.offset, ptr3).unwrap(),
@@ -1830,6 +1945,8 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(value);
         self.write_u64(body);
         self.write_u64(exprish::expr_let_data(
+          self.cfg.expr_hash_v2,
+          tag & 1 == 1,
           get_expr_data(&self.buf, self.offset, ty).unwrap(),
           get_expr_data(&self.buf, self.offset, value).unwrap(),
           get_expr_data(&self.buf, self.offset, body).unwrap(),
@@ -1846,6 +1963,8 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ty);
         self.write_u64(body);
         self.write_u64(exprish::expr_binder_data(
+          self.cfg.expr_hash_v2,
+          tag >> 2 == 7,
           get_expr_data(&self.buf, self.offset, ty).unwrap(),
           get_expr_data(&self.buf, self.offset, body).unwrap(),
         ));
@@ -1860,7 +1979,7 @@ impl<R: Read> LgzDecompressor<R> {
           let ptr2 = self.write_exprish();
           let pos2 = self.write_ctor_header(5, 2, 1);
           let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
-          data = exprish::expr_app_data(data, data2);
+          data = exprish::expr_app_data(self.cfg.expr_hash_v2, data, data2);
           // println!(
           //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
           //   "",
@@ -1893,7 +2012,7 @@ impl<R: Read> LgzDecompressor<R> {
           let ptr2 = self.write_exprish();
           let pos2 = self.write_ctor_header(5, 2, 1);
           let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
-          data = exprish::expr_app_data(data, data2);
+          data = exprish::expr_app_data(self.cfg.expr_hash_v2, data, data2);
           // println!(
           //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
           //   "",
