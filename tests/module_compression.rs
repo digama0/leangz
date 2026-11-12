@@ -164,7 +164,7 @@ fn test_wide_scalar_array_roundtrip() {
 
 /// `ExprHash` was built with a Lean version that writes version 4 `.olean`s, whose compacted data
 /// is framed by its size and a closure section, and whose `Expr` hashes changed in
-/// leanprover/lean4#16107.
+/// leanprover/lean4#16107 and leanprover/lean4#16146.
 #[test]
 fn test_v4_module_roundtrip() {
   let test_data_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/module");

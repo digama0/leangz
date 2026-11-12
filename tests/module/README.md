@@ -60,14 +60,17 @@ run_cmd modifyEnv (floatsExt.addEntry · ⟨#[1.5]⟩)
 run_cmd modifyEnv (floatsExt.addEntry · ⟨#[1.5, 2.5, 3.5]⟩)
 ```
 
-- `ExprHash.olean`, `ExprHash.olean.server`, `ExprHash.olean.private` - A module in the version 4 `.olean` format, whose `Expr` data uses the hashes of leanprover/lean4#16107 (29K, 3.6K, 34K)
+- `ExprHash.olean`, `ExprHash.olean.server`, `ExprHash.olean.private` - A module in the version 4 `.olean` format, whose `Expr` data uses the hashes of leanprover/lean4#16107 and leanprover/lean4#16146
 
-`ExprHash` was built with a Lean 4.37.0 prerelease (`lean -o`) from `ExprHash.lean`, which exercises every `Expr` constructor whose hash changed, including a dependent and a non-dependent `let`:
+`ExprHash` was built with a Lean 4.37.0 prerelease (`lean -o`) from `ExprHash.lean`, which exercises every `Expr` constructor whose hash changed, including a dependent and a non-dependent `let` and `Nat` literals of one, two and three 64-bit words:
 
 ```lean
 module
 
-/-! Exercises every `Expr` constructor whose cached hash changed in leanprover/lean4#16107. -/
+/-!
+Exercises every `Expr` constructor whose cached hash changed in leanprover/lean4#16107 or
+leanprover/lean4#16146.
+-/
 
 public structure Point where
   x : Nat
@@ -87,6 +90,11 @@ public def lets (n : Nat) : Nat :=
 
 -- a dependent `Expr.letE`: the body only typechecks with the value of `n`
 public def depLet : Fin 2 := let n := 2; (⟨0, by decide⟩ : Fin n)
+
+-- `Expr.lit` of `Nat` literals that are not scalars: 2^63, whose hash is unchanged, and 2^64 and
+-- 2^128 + 1, whose hash changed in leanprover/lean4#16146
+public def bigLits : List Nat :=
+  [9223372036854775808, 18446744073709551616, 340282366920938463463374607431768211457]
 
 -- `Expr.mdata` from tactic proofs
 public theorem sum_comm (p : Point) : p.sum = p.y + p.x := by

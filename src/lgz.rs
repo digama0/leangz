@@ -298,7 +298,8 @@ fn parse_olean_header(version: OLeanVersion, olean: &[u8]) -> (Header, &[u8]) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Config {
   use_gmp: bool,
-  /// Whether `Expr` data uses the hashes introduced in Lean 4.37 (leanprover/lean4#16107).
+  /// Whether `Expr` data uses the hashes introduced in Lean 4.37 (leanprover/lean4#16107 and,
+  /// for `Nat` literals, leanprover/lean4#16146).
   expr_hash_v2: bool,
 }
 
@@ -926,12 +927,42 @@ fn get_expr_data(buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   }
   None
 }
+/// `Literal.natHash` (leanprover/lean4#16146): the number itself if it is below 2^64, and
+/// otherwise its 64-bit words `w₀, …, wₖ` (with `wₖ ≠ 0`) combined as `mix(… mix(w₀, w₁) …, wₖ)`.
+fn get_nat_lit_hash(cfg: Config, buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
+  if ptr & 1 == 1 {
+    return Some(ptr >> 1)
+  }
+  let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
+  if header.tag != tag::MPZ {
+    return None
+  }
+  let mut words: Vec<u64> = if cfg.use_gmp {
+    let (_capacity, pos) = parse_u32(buf, pos);
+    let (sign_size, pos) = parse_i32(buf, pos);
+    let (_limbs_ptr, pos) = parse_u64(buf, pos);
+    (0..sign_size.unsigned_abs() as usize).map(|i| parse_u64(buf, pos + 8 * i).0).collect()
+  } else {
+    let (_sign, pos) = parse_u64(buf, pos);
+    let (size, pos) = parse_u64(buf, pos);
+    let (_digits_ptr, pos) = parse_u64(buf, pos);
+    let digit = |i: u64| if i < size { parse_u32(buf, pos + 4 * i as usize).0 as u64 } else { 0 };
+    (0..size.div_ceil(2)).map(|i| digit(2 * i) | digit(2 * i + 1) << 32).collect()
+  };
+  while words.last() == Some(&0) {
+    words.pop();
+  }
+  let (&first, rest) = words.split_first()?;
+  Some(rest.iter().fold(first, |h, &w| mix_hash(h, w)))
+}
+
 fn get_lit_hash(cfg: Config, buf: &[u8], offset: u64, ptr: u64) -> Option<u64> {
   if ptr & 1 != 0 {
     return None
   }
   let (header, pos) = parse::<ObjHeader>(buf, (ptr - offset) as usize);
   match header.tag {
+    0 if cfg.expr_hash_v2 => get_nat_lit_hash(cfg, buf, offset, parse_u64(buf, pos).0),
     0 => get_num_hash(cfg, buf, offset, parse_u64(buf, pos).0),
     1 => get_str_hash(buf, offset, parse_u64(buf, pos).0),
     _ => None,
@@ -1050,7 +1081,9 @@ impl<W: Write> LgzWriter<'_, W> {
           let (ptr2, pos) = parse_u64(self.buf, pos);
           let Some(data1) = get_expr_data(self.buf, self.offset, ptr1) else { break };
           let Some(data2) = get_expr_data(self.buf, self.offset, ptr2) else { break };
-          if exprish::expr_app_data(self.cfg.expr_hash_v2, data1, data2) == parse_u64(self.buf, pos).0 {
+          if exprish::expr_app_data(self.cfg.expr_hash_v2, data1, data2)
+            == parse_u64(self.buf, pos).0
+          {
             ptr = Some(ptr1);
             stack.push(ptr2);
             if ptr1 & 1 == 0 && !self.is_reused(ptr1) {
@@ -1261,7 +1294,9 @@ impl<W: Write> LgzWriter<'_, W> {
         let (bi, _) = parse_u64(self.buf, pos);
         let data1 = get_expr_data(self.buf, self.offset, ty)?;
         let data2 = get_expr_data(self.buf, self.offset, body)?;
-        if exprish::expr_binder_data(self.cfg.expr_hash_v2, ctor == 7, data1, data2) == data && bi & !3 == 0 {
+        if exprish::expr_binder_data(self.cfg.expr_hash_v2, ctor == 7, data1, data2) == data
+          && bi & !3 == 0
+        {
           self.write_op(mode, LgzMode::Exprish, (ctor << 2) + bi as u8);
           self.write_obj(name, LgzMode::Exprish);
           self.write_obj(ty, LgzMode::Exprish);
@@ -2179,5 +2214,55 @@ impl<R: Read> LgzDecompressor<R> {
     //   d = self.depth,
     // );
     pos
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// An `MPZ` object in the GMP layout, with 64-bit limbs.
+  fn gmp_obj(limbs: &[u64]) -> Vec<u8> {
+    let n = limbs.len() as u32;
+    let cs_sz = (((n + 3) << 3) as u16).into();
+    let header = ObjHeader { rc: 0.into(), cs_sz, num_fields: 0, tag: tag::MPZ };
+    let mut buf = header.as_bytes().to_vec();
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&(n as i32).to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    limbs.iter().for_each(|l| buf.extend_from_slice(&l.to_le_bytes()));
+    buf
+  }
+
+  /// An `MPZ` object in Lean's own layout, with 32-bit digits.
+  fn native_obj(digits: &[u32]) -> Vec<u8> {
+    let n = digits.len() as u64;
+    let cs_sz = (((n + 8) << 2) as u16).into();
+    let header = ObjHeader { rc: 0.into(), cs_sz, num_fields: 0, tag: tag::MPZ };
+    let mut buf = header.as_bytes().to_vec();
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    digits.iter().for_each(|d| buf.extend_from_slice(&d.to_le_bytes()));
+    buf
+  }
+
+  /// `Lean.Literal.natHash` of these numbers, as computed by Lean.
+  #[test]
+  fn nat_lit_hash() {
+    let cases: [(&[u64], &[u32], u64); 4] = [
+      (&[1 << 63], &[0, 1 << 31], 9223372036854775808), // 2^63
+      (&[0, 1], &[0, 0, 1], 18217991133577325693),      // 2^64
+      (&[1, 0, 1], &[1, 0, 0, 0, 1], 3576400244411197041), // 2^128 + 1
+      (&[(1 << 32) + 5, 1], &[5, 1, 1], 12435334367290419516), // 2^64 + 2^32 + 5
+    ];
+    let gmp = Config { use_gmp: true, expr_hash_v2: true };
+    let native = Config { use_gmp: false, expr_hash_v2: true };
+    for (limbs, digits, hash) in cases {
+      assert_eq!(get_nat_lit_hash(gmp, &gmp_obj(limbs), 0, 0), Some(hash));
+      assert_eq!(get_nat_lit_hash(native, &native_obj(digits), 0, 0), Some(hash));
+    }
+    let scalar = (12345 << 1) | 1;
+    assert_eq!(get_nat_lit_hash(gmp, &[], 0, scalar), Some(12345));
   }
 }
