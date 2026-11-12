@@ -816,69 +816,89 @@ pub fn pack(
       }
       Arg::File(f, m) => (f, m),
     };
-    if version >= LtarVersion::V3 {
-      tarfile.write_u8(idx)?;
-    } else {
-      assert!(idx == 0);
-    }
-    tarfile.write_all(file.as_bytes())?;
-    tarfile.write_u8(0)?;
-    let path = basedirs.get(idx as usize).expect("not enough parent paths").join(file);
+    let open = |(idx, file): &(u8, String)| -> io::Result<(PathBuf, Mmap)> {
+      let path = basedirs.get(*idx as usize).expect("not enough parent paths").join(file);
+      let mmap = unsafe { Mmap::map(&File::open(&path)?)? };
+      Ok((path, mmap))
+    };
+    let (path, mmap) = open(&(idx, file.clone()))?;
+    let module = match module {
+      Some([f2, f3]) => Some([(open(&f2)?, f2), (open(&f3)?, f3)]),
+      None => None,
+    };
+    let is_olean = path.extension().is_some_and(|x| x == "olean");
+    // Files that `lgz` cannot handle (such as `.olean`s with closures) are packed one by one.
+    let use_lgz = is_olean
+      && mmap.get(..5) == Some(b"olean")
+      && lgz::is_supported(&mmap)
+      && module.iter().flatten().all(|((_, mmap), _)| lgz::is_supported(mmap));
+    write_entry_name(&mut tarfile, version, idx, &file)?;
     if verbose {
       println!("compressing {}", path.display());
     }
-    let is_olean = path.extension().is_some_and(|x| x == "olean");
-    let mmap = unsafe { Mmap::map(&File::open(&path)?)? };
-    if is_olean && mmap.get(..5) == Some(b"olean") {
-      let mut buf = vec![];
+    if use_lgz {
       tarfile.write_u8(if module.is_some() { COMPRESSION_LGZ_MODULE } else { COMPRESSION_LGZ })?;
-      let (server, private);
-      let mmaps: &[&[u8]] = if let Some([f2, f3]) = module {
-        let mut f = |(idx, file): (u8, String)| -> io::Result<_> {
-          if version >= LtarVersion::V3 {
-            tarfile.write_u8(idx)?;
-          } else {
-            assert!(idx == 0);
-          }
-          tarfile.write_all(file.as_bytes())?;
-          tarfile.write_u8(0)?;
-          let path = basedirs.get(idx as usize).expect("not enough parent paths").join(file);
-          if verbose {
-            println!("          + {}", path.display());
-          }
-          Ok(unsafe { Mmap::map(&File::open(path)?)? })
-        };
-        (server, private) = (f(f2)?, f(f3)?);
-        &[&mmap, &server, &private]
-      } else {
-        &[&mmap]
-      };
+      let mut mmaps: Vec<&[u8]> = vec![&mmap];
+      for ((path, mmap), (idx, file)) in module.iter().flatten() {
+        write_entry_name(&mut tarfile, version, *idx, file)?;
+        if verbose {
+          println!("          + {}", path.display());
+        }
+        mmaps.push(mmap);
+      }
+      let mut buf = vec![];
       #[cfg(feature = "zstd")]
       {
         #[cfg(feature = "zstd-dict")]
         let mut enc = zstd::stream::Encoder::with_prepared_dictionary(&mut buf, &dict_v1)?;
         #[cfg(not(feature = "zstd-dict"))]
         let mut enc = zstd::stream::Encoder::new(&mut buf, COMPRESSION_LEVEL)?;
-        lgz::compress(mmaps, &mut enc);
+        lgz::compress(&mmaps, &mut enc);
         enc.finish()?;
       }
       #[cfg(not(feature = "zstd"))]
-      lgz::compress(mmaps, &mut buf);
+      lgz::compress(&mmaps, &mut buf);
       tarfile.write_u64::<LE>(buf.len() as u64)?;
       tarfile.write_all(&buf)?;
-    } else if let Some(n) = (|| {
-      if mmap.len() > 20 {
-        return None
-      }
-      std::str::from_utf8(&mmap).ok()?.parse::<u64>().ok()
-    })() {
-      tarfile.write_u8(COMPRESSION_HASH_PLAIN)?;
-      tarfile.write_u64::<LE>(n)?;
     } else {
-      pack_zstd(&mmap, &mut tarfile)?;
+      pack_other(&mmap, &mut tarfile)?;
+      for ((path, mmap), (idx, file)) in module.iter().flatten() {
+        write_entry_name(&mut tarfile, version, *idx, file)?;
+        if verbose {
+          println!("compressing {}", path.display());
+        }
+        pack_other(mmap, &mut tarfile)?;
+      }
     }
   }
   Ok(())
+}
+
+fn write_entry_name(
+  tarfile: &mut impl Write, version: LtarVersion, idx: u8, file: &str,
+) -> io::Result<()> {
+  if version >= LtarVersion::V3 {
+    tarfile.write_u8(idx)?;
+  } else {
+    assert!(idx == 0);
+  }
+  tarfile.write_all(file.as_bytes())?;
+  tarfile.write_u8(0)
+}
+
+/// Packs a file that is not compressed with `lgz`.
+fn pack_other(data: &[u8], tarfile: &mut impl Write) -> io::Result<()> {
+  if let Some(n) = (|| {
+    if data.len() > 20 {
+      return None
+    }
+    std::str::from_utf8(data).ok()?.parse::<u64>().ok()
+  })() {
+    tarfile.write_u8(COMPRESSION_HASH_PLAIN)?;
+    tarfile.write_u64::<LE>(n)
+  } else {
+    pack_zstd(data, tarfile)
+  }
 }
 
 fn pack_zstd(data: &[u8], tarfile: &mut impl Write) -> io::Result<()> {
